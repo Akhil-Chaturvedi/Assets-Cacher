@@ -41,7 +41,7 @@ Since this extension is not on the Chrome Web Store, you can install it locally 
 
 4.  **Load the Extension**:
     -   Click the **"Load unpacked"** button that appears.
-    -   In the file selection dialog, navigate to and select the `smart-asset-cache` folder (the one that contains `manifest.json`).
+    -   In the file selection dialog, navigate to and select the `assets-cacher` folder (the one that contains `manifest.json`).
     -   Click "Select Folder".
 
 The extension is now installed! You should see the "Assets Cacher" icon (you may need to pin it) in your Chrome toolbar.
