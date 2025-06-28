@@ -1,6 +1,6 @@
 # 🧠 Assets Cacher
 
-> A lightweight Chrome extension to reduce bandwidth usage by caching frequently downloaded assets like images, scripts, and fonts, with per-site controls.
+- A lightweight Chrome extension to reduce bandwidth usage by caching frequently downloaded assets like images, scripts, and fonts, with per-site controls.
 
 ---
 
@@ -28,7 +28,7 @@ Since this extension is not on the Chrome Web Store, you can install it locally 
 1.  **Download the Code**:
     -   Clone this repository to your local machine:
         ```bash
-        git clone https://github.com/your-username/smart-asset-cache.git
+        git clone https://github.com/Akhil-Chaturvedi/Assets-Cacher.git
         ```
     -   Or, click the "Code" button on GitHub and select **"Download ZIP"**, then unzip the file.
 
