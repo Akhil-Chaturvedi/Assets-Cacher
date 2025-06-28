@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Smart Asset Cache</title>
+    <link rel="stylesheet" href="popup.css">
+    <style>.options-link { margin-top: 16px; text-align: center; } </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h3>Smart Asset Cache</h3>
+            <p id="hostname">Loading...</p>
+        </div>
+
+        <div class="toggle-section">
+            <label for="enabled-switch">Enable for this site</label>
+            <label class="switch">
+                <input type="checkbox" id="enabled-switch">
+                <span class="slider round"></span>
+            </label>
+        </div>
+
+        <div class="stats-section">
+            <h4>Cache Status</h4>
+            <p><strong>Bandwidth Saved:</strong> <span id="savings-size" class="savings">0 KB</span></p>
+            <p><strong>Cached Items:</strong> <span id="item-count">0</span></p>
+            <p><strong>Total Size:</strong> <span id="cache-size">0 KB</span></p>
+        </div>
+
+        <button id="purge-button">Purge Cache for this Site</button>
+        <div class="options-link">
+            <a href="#" id="options-link">Manage Global Cache & Settings</a>
+        </div>
+    </div>
+    <script src="popup.js"></script>
+</body>
+</html>

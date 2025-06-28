@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Smart Cache Options</title>
+    <link rel="stylesheet" href="popup.css">
+    <style>
+        body { width: auto; max-width: 900px; margin: 2em auto; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2em; }
+        .section { padding: 1.5em; border: 1px solid #dfe1e6; border-radius: 4px; background: #fff; }
+        h4 { margin-top: 0; border-bottom: 1px solid #dfe1e6; padding-bottom: 0.5em;}
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #dfe1e6; font-size: 12px; }
+        th { font-weight: 600; }
+        td { word-break: break-all; }
+        .table-wrapper { max-height: 400px; overflow-y: auto; }
+        form label { display: block; margin-bottom: 0.5em; font-weight: 600; }
+        form input, form select { width: 100%; padding: 8px; box-sizing: border-box; margin-bottom: 1em; }
+        button#purge-all-button { background-color: #de350b; color: white; border: none;}
+        button#purge-all-button:hover { background-color: #bf2600; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Global Cache Management</h2>
+        <div class="grid">
+            <div class="section">
+                <h4>Global Statistics</h4>
+                <p><strong>Total Bandwidth Saved:</strong> <span id="global-savings">...</span></p>
+                <p><strong>Total Items Cached:</strong> <span id="global-items">...</span></p>
+                <p><strong>Total Cache Size:</strong> <span id="global-size">...</span></p>
+            </div>
+            <div class="section">
+                <h4>Cache Eviction Policy</h4>
+                <form id="settings-form">
+                    <label for="max-age">Max Cache Age</label>
+                    <select id="max-age">
+                        <option value="0">Unlimited</option>
+                        <option value="1">1 Day</option>
+                        <option value="7">7 Days</option>
+                        <option value="30">30 Days</option>
+                    </select>
+                    <button type="submit">Save Settings</button>
+                </form>
+            </div>
+        </div>
+        <div class="section" style="margin-top: 2em;">
+            <h4>Detailed Cache Viewer</h4>
+            <div class="table-wrapper">
+                <table id="cache-table">
+                    <thead><tr><th>URL</th><th>Size</th><th>Cached On</th><th>Last Accessed</th></tr></thead>
+                    <tbody><tr><td colspan="4">Loading cache data...</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="section" style="margin-top: 2em;">
+            <h4>Danger Zone</h4>
+            <button id="purge-all-button">Purge All Cached Data for All Sites</button>
+        </div>
+    </div>
+    <script src="options.js"></script>
+</body>
+</html>
