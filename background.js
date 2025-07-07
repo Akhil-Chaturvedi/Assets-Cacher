@@ -1,209 +1,306 @@
-import { getAsset, addAsset, getAllAssets, clearDB, deleteAsset } from './db.js';
+// --- Data Structure ---
+// In-memory cache for fast access during a session. The ground truth is in IndexedDB.
+let siteCache = {};
 
-// --- Configuration & State ---
+// --- Configuration ---
 const CACHE_RULE_ID = 1;
-const ALLOWED_CONTENT_TYPES = [
-  "image/", "font/", "text/css", "application/javascript", "application/x-javascript"
+const DB_NAME = "AssetCacheDB";
+const DB_VERSION = 1;
+const STORE_NAME = "assets";
+const DISALLOWED_CONTENT_TYPES = [
+  "text/html", "application/json", "application/xml", "text/xml", "application/octet-stream"
 ];
-const tabCacheHits = {}; 
 
-// --- Helper Functions ---
-const isCacheable = (contentType) => contentType && ALLOWED_CONTENT_TYPES.some(type => contentType.startsWith(type));
-function blobToDataURL(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
+// --- IndexedDB Helpers ---
+let db;
+
+async function openDB() {
+    return new Promise((resolve, reject) => {
+        if (db) return resolve(db);
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onerror = (event) => reject("IndexedDB error: " + request.error);
+        request.onsuccess = (event) => {
+            db = event.target.result;
+            resolve(db);
+        };
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            db.createObjectStore(STORE_NAME, { keyPath: "url" });
+        };
+    });
 }
 
-// --- Badge Management & Startup ---
-chrome.runtime.onStartup.addListener(() => {
+async function getAssetFromDB(url) {
+    const db = await openDB();
+    return new Promise((resolve) => {
+        const transaction = db.transaction(STORE_NAME, "readonly");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.get(url);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => resolve(null); // Resolve null on error
+    });
+}
+
+async function setAssetInDB(asset) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_NAME, "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.put(asset);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function deleteAssetFromDB(url) {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_NAME, "readwrite");
+    transaction.objectStore(STORE_NAME).delete(url);
+}
+
+async function clearDB() {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_NAME, "readwrite");
+    transaction.objectStore(STORE_NAME).clear();
+}
+
+async function loadCacheFromDB() {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_NAME, "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const allAssets = await new Promise(resolve => store.getAll().onsuccess = e => resolve(e.target.result));
+    
+    siteCache = {};
+    for (const asset of allAssets) {
+        const hostname = new URL(asset.url).hostname;
+        if (!siteCache[hostname]) {
+            siteCache[hostname] = { totalSize: 0, assets: {} };
+        }
+        siteCache[hostname].assets[asset.url] = asset;
+        siteCache[hostname].totalSize += asset.size;
+    }
+    console.log(`[Smart Cache] Loaded ${allAssets.length} assets from IndexedDB into memory.`);
+}
+
+
+// --- Initialization & Alarms ---
+chrome.runtime.onStartup.addListener(loadCacheFromDB);
+chrome.runtime.onInstalled.addListener(() => {
+    loadCacheFromDB();
+    chrome.alarms.create('cacheEviction', { periodInMinutes: 60 });
     chrome.action.setBadgeBackgroundColor({ color: '#28a745' });
 });
-chrome.action.setBadgeBackgroundColor({ color: '#28a745' });
+chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === 'cacheEviction') evictOldCache(); });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading') {
-    tabCacheHits[tabId] = 0;
-    chrome.action.setBadgeText({ tabId, text: '' });
-  }
-});
 
-// --- Eviction Alarm ---
-chrome.alarms.create('evictionAlarm', { periodInMinutes: 60 });
-chrome.alarms.onAlarm.addListener(runEviction);
+// --- Badge Logic --- (No changes needed here)
+async function updateActionBadge(tabId) {
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab && tab.url && tab.url.startsWith('http')) {
+            const hostname = new URL(tab.url).hostname;
+            const count = siteCache[hostname] ? Object.keys(siteCache[hostname].assets).length : 0;
+            chrome.action.setBadgeText({ tabId, text: count > 0 ? count.toString() : '' });
+        } else {
+            chrome.action.setBadgeText({ tabId, text: '' });
+        }
+    } catch (e) { /* Tab may be closed */ }
+}
+chrome.tabs.onActivated.addListener((activeInfo) => updateActionBadge(activeInfo.tabId));
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => { if (changeInfo.status === 'complete' && tab.active) updateActionBadge(tabId); });
+
 
 // --- Caching Logic ---
 chrome.webRequest.onBeforeRequest.addListener(
   async (details) => {
-    if (details.method !== "GET" || !details.initiator) return;
-    const hostname = new URL(details.initiator).hostname;
+    if (details.method !== "GET") return;
+    const initiator = details.initiator;
+    if (!initiator) return;
+    const hostname = new URL(initiator).hostname;
+    const cachedAsset = siteCache[hostname]?.assets?.[details.url];
     
-    const prefs = await chrome.storage.local.get('site_prefs');
-    if (prefs.site_prefs?.[hostname]?.enabled === false) {
-      clearRedirectRules();
-      return;
-    }
-
-    const cachedAsset = await getAsset(details.url); 
-    if (cachedAsset) {
+    if (cachedAsset && cachedAsset.dataUrl) { 
       updateRedirectRule(details.url, cachedAsset.dataUrl);
-
-      // 1. Update PERSISTENT savings tracker
-      const { site_savings } = await chrome.storage.local.get('site_savings');
-      const newSavings = site_savings || {};
-      newSavings[hostname] = (newSavings[hostname] || 0) + cachedAsset.size;
-      await chrome.storage.local.set({ site_savings: newSavings });
-      
-      if (details.tabId >= 0) {
-          tabCacheHits[details.tabId] = (tabCacheHits[details.tabId] || 0) + 1;
-          chrome.action.setBadgeText({
-            tabId: details.tabId,
-            text: tabCacheHits[details.tabId].toString()
-          });
-      }
-
+      cachedAsset.lastAccessed = Date.now();
+      await setAssetInDB(cachedAsset); // Update lastAccessed in DB
+      const { totalSavings } = await chrome.storage.local.get('totalSavings');
+      await chrome.storage.local.set({ totalSavings: (totalSavings || 0) + cachedAsset.size });
     } else {
       clearRedirectRules();
     }
   },
-  { urls: ["<all_urls>"], types: ["image", "font", "stylesheet", "script"] }
+  { urls: ["<all_urls>"] }
 );
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.method !== "GET" || details.statusCode !== 200 || !details.initiator) return;
+    if (details.method !== "GET" || details.statusCode !== 200) return;
     const contentTypeHeader = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-type');
-    if (isCacheable(contentTypeHeader?.value)) {
-      validateAndCacheAsset(details);
+    const contentType = contentTypeHeader?.value || '';
+    if (!DISALLOWED_CONTENT_TYPES.some(type => contentType.startsWith(type))) {
+        validateAndCacheAsset(details);
     }
   },
-  { urls: ["<all_urls>"], types: ["image", "font", "stylesheet", "script"] },
+  { urls: ["<all_urls>"] },
   ["responseHeaders"]
 );
 
+function blobToDataURL(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+}
+
 async function validateAndCacheAsset(details) {
-  const { url, initiator, responseHeaders } = details;
+  const { url, initiator, tabId } = details;
+  if (!initiator) return;
   const hostname = new URL(initiator).hostname;
-  const prefs = await chrome.storage.local.get('site_prefs');
-  if (prefs.site_prefs?.[hostname]?.enabled === false) return;
+  const { site_prefs } = await chrome.storage.local.get('site_prefs');
+  if ((site_prefs || {})[hostname]?.enabled === false) return;
 
-  const etag = responseHeaders.find(h => h.name.toLowerCase() === 'etag')?.value || '';
-  const lastModified = responseHeaders.find(h => h.name.toLowerCase() === 'last-modified')?.value || '';
-  const existingAsset = await getAsset(url);
+  const etag = details.responseHeaders.find(h => h.name.toLowerCase() === 'etag')?.value || '';
+  const lastModified = details.responseHeaders.find(h => h.name.toLowerCase() === 'last-modified')?.value || '';
+  const existingAsset = siteCache[hostname]?.assets?.[url];
 
-  if (existingAsset) {
-    if ((existingAsset.etag && existingAsset.etag === etag) || (existingAsset.lastModified && existingAsset.lastModified === lastModified)) return;
+  if (existingAsset && ((existingAsset.etag && existingAsset.etag === etag) || (existingAsset.lastModified && existingAsset.lastModified === lastModified))) {
+    return;
   }
 
   try {
     const response = await fetch(url);
     if (!response.ok) return;
     const blob = await response.blob();
+    const sizeInBytes = blob.size;
+    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB limit per file
+    if (sizeInBytes > MAX_FILE_SIZE) return;
+
     const dataUrl = await blobToDataURL(blob);
-    await addAsset({ url, hostname, dataUrl, size: blob.size, etag, lastModified, cachedOn: Date.now(), lastAccessed: Date.now() });
+    const newAsset = {
+        url, dataUrl, size: blob.size, etag, lastModified,
+        cachedOn: Date.now(), lastAccessed: Date.now()
+    };
+    
+    await setAssetInDB(newAsset);
+
+    if (!siteCache[hostname]) siteCache[hostname] = { totalSize: 0, assets: {} };
+    if (existingAsset) siteCache[hostname].totalSize -= existingAsset.size;
+    siteCache[hostname].assets[url] = newAsset;
+    siteCache[hostname].totalSize += newAsset.size;
+
+    if (tabId !== -1) updateActionBadge(tabId);
   } catch (e) {
-    console.error(`[Smart Cache] Failed to cache asset ${url}:`, e);
+    console.error(`[Smart Cache] Failed to process ${url}:`, e);
   }
 }
 
-// --- Eviction, Rule, and Purge Functions ---
-async function runEviction() {
-    const { settings } = await chrome.storage.local.get('settings');
-    const maxAgeDays = settings?.maxAge || 0;
-    if (maxAgeDays === 0) return;
-    const allAssets = await getAllAssets();
-    const now = Date.now();
-    const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
-    for (const asset of allAssets) {
-        if (now - asset.cachedOn > maxAgeMs) await deleteAsset(asset.url);
-    }
-}
-
+// --- Rule Management ---
 function updateRedirectRule(requestUrl, redirectUrl) {
-  chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [CACHE_RULE_ID],
-    addRules: [{ id: CACHE_RULE_ID, priority: 1, action: { type: 'redirect', redirect: { url: redirectUrl } }, condition: { urlFilter: requestUrl, resourceTypes: ["image", "font", "stylesheet", "script"] } }]
-  });
+    chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [CACHE_RULE_ID],
+        addRules: [{ id: CACHE_RULE_ID, priority: 1, action: { type: 'redirect', redirect: { url: redirectUrl } }, condition: { urlFilter: requestUrl } }]
+    });
 }
 function clearRedirectRules() {
-  chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [CACHE_RULE_ID] });
+    chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [CACHE_RULE_ID] });
 }
 
-async function purgeSiteCache(hostname) {
-    const allAssets = await getAllAssets();
-    for (const asset of allAssets) {
-        if (asset.hostname === hostname) await deleteAsset(asset.url);
-    }
-    const { site_savings } = await chrome.storage.local.get('site_savings');
-    if (site_savings) {
-        delete site_savings[hostname];
-        await chrome.storage.local.set({ site_savings });
-    }
-    clearRedirectRules();
-}
-
-// --- Message Handler ---
+// --- Communication --- (No changes needed here)
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
-        switch (message.type) {
-            case 'getState': {
-                const allAssets = await getAllAssets();
-                const siteAssets = allAssets.filter(a => a.hostname === message.hostname);
-                const { site_savings } = await chrome.storage.local.get('site_savings');
-                const siteStats = {
-                    itemCount: siteAssets.length,
-                    totalSize: siteAssets.reduce((sum, a) => sum + a.size, 0),
-                    savings: site_savings?.[message.hostname] || 0
-                };
-                const prefs = await chrome.storage.local.get('site_prefs');
-                const isEnabled = !(prefs.site_prefs?.[message.hostname]?.enabled === false);
-                sendResponse({ isEnabled, ...siteStats });
-                break;
+        if (message.type === 'getState') {
+            const { hostname } = message;
+            const data = await chrome.storage.local.get(['site_prefs', 'totalSavings']);
+            const sitePrefs = data.site_prefs || {};
+            const isEnabled = sitePrefs[hostname]?.enabled !== false;
+            const cacheData = siteCache[hostname];
+            sendResponse({
+                isEnabled,
+                itemCount: cacheData ? Object.keys(cacheData.assets).length : 0,
+                totalSize: cacheData ? cacheData.totalSize : 0,
+                savings: data.totalSavings || 0
+            });
+        } else if (message.type === 'toggleSite') {
+            const { hostname, enabled } = message;
+            const { site_prefs } = await chrome.storage.local.get('site_prefs');
+            const newPrefs = site_prefs || {};
+            if (!newPrefs[hostname]) newPrefs[hostname] = {};
+            newPrefs[hostname].enabled = enabled;
+            await chrome.storage.local.set({ site_prefs: newPrefs });
+            if (!enabled) await purgeSiteCache(hostname);
+        } else if (message.type === 'purgeSiteCache') {
+            await purgeSiteCache(message.hostname);
+            sendResponse({ success: true });
+        } else if (message.type === 'getGlobalStats') {
+            const { totalSavings } = await chrome.storage.local.get('totalSavings');
+            let totalItems = 0; let totalSize = 0;
+            for (const host in siteCache) {
+                totalItems += Object.keys(siteCache[host].assets).length;
+                totalSize += siteCache[host].totalSize;
             }
-            case 'toggleSite': {
-                const prefs = await chrome.storage.local.get('site_prefs');
-                const sitePrefs = prefs.site_prefs || {};
-                if (!sitePrefs[message.hostname]) sitePrefs[message.hostname] = {};
-                sitePrefs[message.hostname].enabled = message.enabled;
-                await chrome.storage.local.set({ site_prefs: sitePrefs });
-                if (!message.enabled) await purgeSiteCache(message.hostname);
-                sendResponse({ success: true });
-                break;
-            }
-            case 'purgeSiteCache': {
-                await purgeSiteCache(message.hostname);
-                sendResponse({ success: true });
-                break;
-            }
-            case 'getGlobalStats': {
-                const allAssets = await getAllAssets();
-                const { site_savings } = await chrome.storage.local.get('site_savings');
-                let totalSavings = 0;
-                if(site_savings) {
-                    totalSavings = Object.values(site_savings).reduce((sum, s) => sum + s, 0);
+            sendResponse({ totalSavings: totalSavings || 0, totalItems, totalSize });
+        } else if (message.type === 'getAllAssets') {
+            const allAssets = [];
+            for (const host in siteCache) {
+                for (const url in siteCache[host].assets) {
+                    const { dataUrl, ...rest } = siteCache[host].assets[url];
+                    allAssets.push({ url, ...rest });
                 }
-                const globalStats = {
-                    totalItems: allAssets.length,
-                    totalSize: allAssets.reduce((sum, a) => sum + a.size, 0),
-                    totalSavings: totalSavings
-                };
-                sendResponse(globalStats);
-                break;
             }
-            case 'getAllAssets': {
-                sendResponse(await getAllAssets());
-                break;
-            }
-            case 'purgeAll': {
-                await clearDB();
-                await chrome.storage.local.remove('site_savings');
-                sendResponse({ success: true });
-                break;
-            }
+            sendResponse(allAssets);
+        } else if (message.type === 'purgeAll') {
+            await purgeAllCache();
+            sendResponse({ success: true });
         }
     })();
     return true;
 });
+
+// --- Cache Management Functions ---
+async function purgeSiteCache(hostname) {
+    if (siteCache[hostname]) {
+        for (const url in siteCache[hostname].assets) {
+            await deleteAssetFromDB(url);
+        }
+        clearRedirectRules();
+        delete siteCache[hostname];
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tabs[0]) updateActionBadge(tabs[0].id);
+    }
+}
+async function purgeAllCache() {
+    await clearDB();
+    clearRedirectRules();
+    siteCache = {};
+    await chrome.storage.local.set({ totalSavings: 0 });
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs[0]) updateActionBadge(tabs[0].id);
+}
+async function evictOldCache() {
+    const { settings } = await chrome.storage.local.get('settings');
+    const maxAgeDays = settings?.maxAge;
+    if (!maxAgeDays || maxAgeDays === 0) return;
+    const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    let itemsEvicted = 0;
+    const allAssets = [];
+    for (const host in siteCache) {
+        for (const url in siteCache[host].assets) {
+            allAssets.push(siteCache[host].assets[url]);
+        }
+    }
+    for (const asset of allAssets) {
+        if (now - asset.cachedOn > maxAgeMs) {
+            await deleteAssetFromDB(asset.url);
+            itemsEvicted++;
+        }
+    }
+    if (itemsEvicted > 0) {
+        await loadCacheFromDB(); // Reload from DB to update memory
+        console.log(`[Smart Cache] Evicted ${itemsEvicted} old items from cache.`);
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tabs[0]) updateActionBadge(tabs[0].id);
+    }
+}

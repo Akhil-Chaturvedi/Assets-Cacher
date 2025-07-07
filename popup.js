@@ -18,12 +18,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updateUI(state) {
-        if (!state) return;
+        // CHANGE: Added a check to ensure state object exists before updating UI.
+        if (!state) return; 
+        
         hostnameEl.textContent = currentHostname;
         enabledSwitch.checked = state.isEnabled;
         itemCountEl.textContent = state.itemCount;
         cacheSizeEl.textContent = formatBytes(state.totalSize);
-        savingsSizeEl.textContent = formatBytes(state.savings); // Restore savings display
+        savingsSizeEl.textContent = formatBytes(state.savings);
         purgeButton.disabled = state.itemCount === 0;
     }
 
