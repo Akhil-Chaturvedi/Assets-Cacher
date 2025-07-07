@@ -1,5 +1,4 @@
 // --- Data Structure ---
-// In-memory cache for fast access during a session. The ground truth is in IndexedDB.
 let siteCache = {};
 
 // --- Configuration ---
@@ -25,7 +24,9 @@ async function openDB() {
         };
         request.onupgradeneeded = (event) => {
             const db = event.target.result;
-            db.createObjectStore(STORE_NAME, { keyPath: "url" });
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: "url" });
+            }
         };
     });
 }
@@ -37,7 +38,7 @@ async function getAssetFromDB(url) {
         const store = transaction.objectStore(STORE_NAME);
         const request = store.get(url);
         request.onsuccess = () => resolve(request.result);
-        request.onerror = () => resolve(null); // Resolve null on error
+        request.onerror = () => resolve(null);
     });
 }
 
@@ -65,21 +66,29 @@ async function clearDB() {
 }
 
 async function loadCacheFromDB() {
-    const db = await openDB();
-    const transaction = db.transaction(STORE_NAME, "readonly");
-    const store = transaction.objectStore(STORE_NAME);
-    const allAssets = await new Promise(resolve => store.getAll().onsuccess = e => resolve(e.target.result));
-    
-    siteCache = {};
-    for (const asset of allAssets) {
-        const hostname = new URL(asset.url).hostname;
-        if (!siteCache[hostname]) {
-            siteCache[hostname] = { totalSize: 0, assets: {} };
+    try {
+        const db = await openDB();
+        const transaction = db.transaction(STORE_NAME, "readonly");
+        const store = transaction.objectStore(STORE_NAME);
+        const allAssets = await new Promise(resolve => store.getAll().onsuccess = e => resolve(e.target.result));
+        
+        siteCache = {};
+        for (const asset of allAssets) {
+            // --- CRITICAL FIX HERE ---
+            // Use the stored initiator hostname to build the cache correctly.
+            const hostname = asset.initiator; 
+            if (!hostname) continue; // Skip malformed old data
+
+            if (!siteCache[hostname]) {
+                siteCache[hostname] = { totalSize: 0, assets: {} };
+            }
+            siteCache[hostname].assets[asset.url] = asset;
+            siteCache[hostname].totalSize += asset.size;
         }
-        siteCache[hostname].assets[asset.url] = asset;
-        siteCache[hostname].totalSize += asset.size;
+        console.log(`[Smart Cache] Loaded ${allAssets.length} assets from IndexedDB into memory.`);
+    } catch (e) {
+        console.error("Failed to load cache from DB:", e);
     }
-    console.log(`[Smart Cache] Loaded ${allAssets.length} assets from IndexedDB into memory.`);
 }
 
 
@@ -93,7 +102,7 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm.name === 'cacheEviction') evictOldCache(); });
 
 
-// --- Badge Logic --- (No changes needed here)
+// --- Badge Logic ---
 async function updateActionBadge(tabId) {
     try {
         const tab = await chrome.tabs.get(tabId);
@@ -122,7 +131,7 @@ chrome.webRequest.onBeforeRequest.addListener(
     if (cachedAsset && cachedAsset.dataUrl) { 
       updateRedirectRule(details.url, cachedAsset.dataUrl);
       cachedAsset.lastAccessed = Date.now();
-      await setAssetInDB(cachedAsset); // Update lastAccessed in DB
+      await setAssetInDB(cachedAsset);
       const { totalSavings } = await chrome.storage.local.get('totalSavings');
       await chrome.storage.local.set({ totalSavings: (totalSavings || 0) + cachedAsset.size });
     } else {
@@ -179,8 +188,14 @@ async function validateAndCacheAsset(details) {
 
     const dataUrl = await blobToDataURL(blob);
     const newAsset = {
-        url, dataUrl, size: blob.size, etag, lastModified,
-        cachedOn: Date.now(), lastAccessed: Date.now()
+        url,
+        initiator: hostname, // --- CRITICAL FIX HERE --- Store the initiator hostname
+        dataUrl,
+        size: blob.size,
+        etag,
+        lastModified,
+        cachedOn: Date.now(),
+        lastAccessed: Date.now()
     };
     
     await setAssetInDB(newAsset);
@@ -207,7 +222,7 @@ function clearRedirectRules() {
     chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [CACHE_RULE_ID] });
 }
 
-// --- Communication --- (No changes needed here)
+// --- Communication ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
         if (message.type === 'getState') {
@@ -298,7 +313,7 @@ async function evictOldCache() {
         }
     }
     if (itemsEvicted > 0) {
-        await loadCacheFromDB(); // Reload from DB to update memory
+        await loadCacheFromDB();
         console.log(`[Smart Cache] Evicted ${itemsEvicted} old items from cache.`);
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tabs[0]) updateActionBadge(tabs[0].id);
