@@ -31,17 +31,6 @@ async function openDB() {
     });
 }
 
-async function getAssetFromDB(url) {
-    const db = await openDB();
-    return new Promise((resolve) => {
-        const transaction = db.transaction(STORE_NAME, "readonly");
-        const store = transaction.objectStore(STORE_NAME);
-        const request = store.get(url);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => resolve(null);
-    });
-}
-
 async function setAssetInDB(asset) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
@@ -74,20 +63,25 @@ async function loadCacheFromDB() {
         
         siteCache = {};
         for (const asset of allAssets) {
-            // --- CRITICAL FIX HERE ---
-            // Use the stored initiator hostname to build the cache correctly.
-            const hostname = asset.initiator; 
-            if (!hostname) continue; // Skip malformed old data
-
-            if (!siteCache[hostname]) {
-                siteCache[hostname] = { totalSize: 0, assets: {} };
+            // --- THE FINAL BULLETPROOF FIX ---
+            // This try/catch ensures that ONE bad record can NEVER crash the entire service worker.
+            try {
+                if (!asset || !asset.initiator) {
+                    continue; // Skip invalid or old data records
+                }
+                const hostname = asset.initiator;
+                if (!siteCache[hostname]) {
+                    siteCache[hostname] = { totalSize: 0, assets: {} };
+                }
+                siteCache[hostname].assets[asset.url] = asset;
+                siteCache[hostname].totalSize += asset.size;
+            } catch (e) {
+                console.warn("[Smart Cache] Corrupted record found in DB and skipped:", asset, e);
             }
-            siteCache[hostname].assets[asset.url] = asset;
-            siteCache[hostname].totalSize += asset.size;
         }
         console.log(`[Smart Cache] Loaded ${allAssets.length} assets from IndexedDB into memory.`);
     } catch (e) {
-        console.error("Failed to load cache from DB:", e);
+        console.error("[Smart Cache] CRITICAL: Failed to load cache from DB:", e);
     }
 }
 
@@ -189,7 +183,7 @@ async function validateAndCacheAsset(details) {
     const dataUrl = await blobToDataURL(blob);
     const newAsset = {
         url,
-        initiator: hostname, // --- CRITICAL FIX HERE --- Store the initiator hostname
+        initiator: hostname,
         dataUrl,
         size: blob.size,
         etag,
@@ -246,7 +240,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await chrome.storage.local.set({ site_prefs: newPrefs });
             if (!enabled) await purgeSiteCache(hostname);
         } else if (message.type === 'purgeSiteCache') {
-            await purgeSiteCache(message.hostname);
+            await purgeSiteCache(hostname);
             sendResponse({ success: true });
         } else if (message.type === 'getGlobalStats') {
             const { totalSavings } = await chrome.storage.local.get('totalSavings');
