@@ -12,14 +12,16 @@ Do you visit websites that are heavy on images or use the same JavaScript librar
 
 ## ✨ Key Features
 
--   **Selective Caching**: Intelligently caches common asset types like images (`jpg`, `png`, `webp`), scripts (`js`), stylesheets (`css`), and fonts.
--   **Per-Site Control**: Easily enable or disable caching for any website with a single click in the extension popup.
--   **Stale Cache Validation**: Uses `ETag` and `Last-Modified` headers to automatically check if an asset has been updated on the server. If it has, the new version is fetched and re-cached.
--   **Cache Management**:
-    -   View the number of cached items and the total size of the cache for the current site.
-    -   Manually purge the entire cache for a specific site with one button.
--   **Bandwidth Savings**: Drastically reduces data consumption on asset-heavy websites you frequent.
--   **Built for Manifest V3**: Uses the modern, secure Chrome Extension platform.
+-   **Aggressive Caching:** Intelligently caches static assets like images, JS, CSS, and fonts to reduce redundant downloads.
+-   **Bandwidth Savings Tracker:** See a running total of the data you've saved in the popup and options page.
+-   **Per-Site Control:** Caching is enabled by default. You can easily disable it for any specific website with a single click.
+-   **Advanced Cache Management (Options Page):**
+    -   View global statistics (total items cached, total size, total bandwidth saved).
+    -   See a detailed table of every single cached asset, including its size and cache date.
+    -   Set a global cache eviction policy (e.g., automatically delete assets older than 30 days).
+    -   Purge the entire cache for all sites with one click.
+-   **Smart Validation:** Respects `ETag` and `Last-Modified` headers to automatically fetch fresh assets when they are updated on the server.
+-   **Built for Manifest V3:** Uses a modern, secure, and persistent architecture with IndexedDB for storage.
 
 ## 🚀 Installation
 
@@ -41,32 +43,30 @@ Since this extension is not on the Chrome Web Store, you can install it locally 
 
 4.  **Load the Extension**:
     -   Click the **"Load unpacked"** button that appears.
-    -   In the file selection dialog, navigate to and select the `assets-cacher` folder (the one that contains `manifest.json`).
+    -   In the file selection dialog, navigate to and select the `Assets-Cacher` folder (the one that contains `manifest.json`).
     -   Click "Select Folder".
 
 The extension is now installed! You should see the "Assets Cacher" icon (you may need to pin it) in your Chrome toolbar.
 
 ## 🛠️ How to Use
 
-1.  **Navigate** to any website.
-2.  **Click** on the Assets Cacher icon in your toolbar to open the popup.
-3.  **Enable Caching**: The popup will show the current site's hostname. Use the toggle switch to enable caching for this site.
-4.  **Browse**: As you browse the site, the extension will automatically start caching eligible assets in the background. Reload a page to see the effect—assets will be served from the cache on the second load.
-5.  **Check Status**: Click the icon again at any time to see how many items have been cached and the total disk space saved.
-6.  **Purge Cache**: If you're experiencing issues or want to clear the stored data for the site, simply click the **"Purge Cache for this Site"** button.
+1.  **Navigate** to any website. Caching is enabled by default and will start working in the background.
+2.  **Check the Badge**: The extension icon will show a green badge with the number of assets cached for the current site.
+3.  **View Stats**: Click the Assets Cacher icon to open the popup and see stats for the current site, including bandwidth saved.
+4.  **Disable Caching**: If a site isn't working correctly, simply use the toggle in the popup to disable caching for that domain.
+5.  **Manage Everything**: Click the "Options" link in the popup to access the global cache manager, see all cached files, and purge data.
 
 ## ⚙️ How It Works (The Technical Details)
 
-This extension uses a two-step process aligned with Manifest V3's non-blocking API requirements:
+This extension uses a persistent, service-worker-compatible architecture to cache assets.
 
-1.  **Redirection (`onBeforeRequest`)**: This listener fires *before* a network request is made. It performs a very fast check against the in-memory cache. If a fresh, valid asset exists, it uses the `chrome.declarativeNetRequest` API to create a dynamic rule that redirects the request to a local `blob:` URL, skipping the network entirely.
+1.  **Fetch and Convert (`onCompleted`)**: After a network request for a cacheable asset (like an image or script) finishes, the extension fetches it in the background. It then converts the asset's binary data into a `data:` URL (a Base64 encoded string).
 
-2.  **Caching & Validation (`onCompleted`)**: This listener fires *after* a network request has finished.
-    -   It checks the response's `Content-Type` header to see if the asset is cacheable.
-    -   It compares the response's `ETag` and `Last-Modified` headers against any existing cached version.
-    -   If the asset is new or has been updated (stale cache), it fetches the full content in the background, creates a `blob:`, and stores it in the cache for future requests.
+2.  **Store in IndexedDB**: This `data:` URL, along with metadata like the ETag, size, and the original website's domain (`initiator`), is stored in the browser's IndexedDB. This provides a large, persistent storage solution that works perfectly within a Manifest V3 service worker.
 
-This separation ensures that the performance-critical redirection path is as fast as possible, while the heavier work of caching happens asynchronously.
+3.  **Intercept and Redirect (`onBeforeRequest`)**: Before any subsequent request is made, the extension checks its in-memory cache (loaded from IndexedDB). If a valid, fresh entry exists, it uses the `chrome.declarativeNetRequest` API to create a dynamic rule. This rule instantly redirects the browser's request to the stored `data:` URL, completely avoiding the network and serving the asset in microseconds.
+
+This model is robust, fully persistent across browser sessions, and respects the technical constraints of the modern Manifest V3 platform.
 
 ## 📜 License
 
