@@ -1,16 +1,17 @@
-# 🧠 Assets Cacher
+# Assets Cacher
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 - A lightweight Chrome extension to reduce bandwidth usage by caching frequently downloaded assets like images, scripts, and fonts, with per-site controls.
 
 ---
 
-## 🤔 What's the Big Idea?
+## What's the Big Idea?
 
 Do you visit websites that are heavy on images or use the same JavaScript libraries on every page? Every time you navigate, your browser might be re-downloading these same assets, consuming your bandwidth and slowing down page loads.
 
 **Assets Cacher** intercepts these requests. The first time an asset is downloaded, the extension saves a copy. On all subsequent requests for that *exact same asset*, it serves the saved copy directly from your local machine, resulting in near-instantaneous loads and saving you data.
 
-## ✨ Key Features
+## Key Features
 
 -   **Aggressive Caching:** Intelligently caches static assets like images, JS, CSS, and fonts to reduce redundant downloads.
 -   **Bandwidth Savings Tracker:** See a running total of the data you've saved in the popup and options page.
@@ -23,7 +24,7 @@ Do you visit websites that are heavy on images or use the same JavaScript librar
 -   **Smart Validation:** Respects `ETag` and `Last-Modified` headers to automatically fetch fresh assets when they are updated on the server.
 -   **Built for Manifest V3:** Uses a modern, secure, and persistent architecture with IndexedDB for storage.
 
-## 🚀 Installation
+## Installation
 
 Since this extension is not on the Chrome Web Store, you can install it locally by following these steps:
 
@@ -48,7 +49,7 @@ Since this extension is not on the Chrome Web Store, you can install it locally 
 
 The extension is now installed! You should see the "Assets Cacher" icon (you may need to pin it) in your Chrome toolbar.
 
-## 🛠️ How to Use
+## How to Use
 
 1.  **Navigate** to any website. Caching is enabled by default and will start working in the background.
 2.  **Check the Badge**: The extension icon will show a green badge with the number of assets cached for the current site.
@@ -56,7 +57,7 @@ The extension is now installed! You should see the "Assets Cacher" icon (you may
 4.  **Disable Caching**: If a site isn't working correctly, simply use the toggle in the popup to disable caching for that domain.
 5.  **Manage Everything**: Click the "Options" link in the popup to access the global cache manager, see all cached files, and purge data.
 
-## ⚙️ How It Works (The Technical Details)
+## How It Works (The Technical Details)
 
 This extension uses a persistent, service-worker-compatible architecture to cache assets.
 
@@ -68,6 +69,6 @@ This extension uses a persistent, service-worker-compatible architecture to cach
 
 This model is robust, fully persistent across browser sessions, and respects the technical constraints of the modern Manifest V3 platform.
 
-## 📜 License
+## License
 
-This project is licensed under the GPL-3.0 License.
+This project is licensed under the **GPL-3.0 License**(LICENSE).
