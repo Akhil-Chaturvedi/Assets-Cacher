@@ -1,6 +1,6 @@
 // --- IndexedDB Module for Assets Cacher ---
 const DB_NAME = "AssetCacheDB";
-const DB_VERSION = 2; // Bumped to add initiator index
+const DB_VERSION = 3; // Bumped to 3 to recreate store for Blob objects
 const STORE_NAME = "assets";
 
 let db = null;

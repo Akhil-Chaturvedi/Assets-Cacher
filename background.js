@@ -1,9 +1,14 @@
 // --- Assets Cacher Background Service Worker ---
 import { openDB, setAsset, getAsset, getAllAssets, deleteAsset, clearAllAssets, getAssetsByInitiator } from './db.js';
 
-// --- Data Structure (metadata only, no dataUrl in memory) ---
+// --- Data Structure (metadata only, no blob in memory) ---
 let siteCache = {};
-let loadedSites = new Set(); // Track which sites have been loaded from IndexedDB
+let siteLoadPromises = new Map(); // Store promises to prevent concurrent DB loads
+const MAX_SITES_IN_MEMORY = 30;
+
+// --- Stats Batching ---
+let pendingStats = { hits: 0, misses: 0, bytesSaved: 0 };
+let statWriteTimer = null;
 
 // --- Configuration ---
 const DISALLOWED_CONTENT_TYPES = [
@@ -18,91 +23,149 @@ console.log("[Assets Cacher] Service worker starting...");
 function normalizeUrl(url) {
     try {
         const parsed = new URL(url);
+        // Strip common tracking parameters to improve cache hit rate
+        const params = new URLSearchParams(parsed.search);
+        ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid'].forEach(p => params.delete(p));
+        parsed.search = params.toString();
         return parsed.origin + parsed.pathname + parsed.search;
     } catch (e) {
         return url;
     }
 }
 
+// --- LRU Cache Update ---
+function updateLRU(hostname) {
+    if (siteCache[hostname]) {
+        // Move to the back by deleting and re-inserting
+        const data = siteCache[hostname];
+        delete siteCache[hostname];
+        siteCache[hostname] = data;
+    }
+
+    // Evict oldest if we exceed limit
+    const keys = Object.keys(siteCache);
+    if (keys.length > MAX_SITES_IN_MEMORY) {
+        const oldestHost = keys[0];
+        delete siteCache[oldestHost];
+        siteLoadPromises.delete(oldestHost);
+    }
+}
+
 // --- Lazy Loading: Load a site's cache from IndexedDB when first accessed ---
-async function ensureSiteLoaded(hostname) {
-    if (loadedSites.has(hostname)) {
-        return; // Already loaded
+function ensureSiteLoaded(hostname) {
+    if (siteLoadPromises.has(hostname)) {
+        updateLRU(hostname);
+        return siteLoadPromises.get(hostname);
     }
 
     console.log(`[Assets Cacher] Lazy loading cache for ${hostname}...`);
-    loadedSites.add(hostname); // Mark as loading to prevent duplicate loads
 
-    try {
-        const assets = await getAssetsByInitiator(hostname);
+    const promise = (async () => {
+        try {
+            const assets = await getAssetsByInitiator(hostname);
 
-        if (assets && assets.length > 0) {
             if (!siteCache[hostname]) {
                 siteCache[hostname] = { totalSize: 0, assets: {} };
             }
 
-            for (const asset of assets) {
-                if (!asset || !asset.url) continue;
+            if (assets && assets.length > 0) {
+                for (const asset of assets) {
+                    if (!asset || !asset.url) continue;
 
-                siteCache[hostname].assets[asset.url] = {
-                    url: asset.url,
-                    initiator: asset.initiator,
-                    size: asset.size,
-                    etag: asset.etag,
-                    lastModified: asset.lastModified,
-                    cachedOn: asset.cachedOn,
-                    lastAccessed: asset.lastAccessed,
-                    contentType: asset.contentType,
-                    compressed: asset.compressed
-                };
-                siteCache[hostname].totalSize += asset.size;
+                    siteCache[hostname].assets[asset.url] = {
+                        url: asset.url,
+                        initiator: asset.initiator,
+                        size: asset.size,
+                        etag: asset.etag,
+                        lastModified: asset.lastModified,
+                        cachedOn: asset.cachedOn,
+                        lastAccessed: asset.lastAccessed,
+                        contentType: asset.contentType,
+                        compressed: asset.compressed
+                    };
+                    siteCache[hostname].totalSize += asset.size;
+                }
+                console.log(`[Assets Cacher] Loaded ${assets.length} cached assets for ${hostname}`);
             }
-
-            console.log(`[Assets Cacher] Loaded ${assets.length} cached assets for ${hostname}`);
+            updateLRU(hostname);
+        } catch (e) {
+            console.error(`[Assets Cacher] Failed to load cache for ${hostname}:`, e);
+            siteLoadPromises.delete(hostname); // Allow retry on failure
         }
-    } catch (e) {
-        console.error(`[Assets Cacher] Failed to load cache for ${hostname}:`, e);
-    }
+    })();
+
+    siteLoadPromises.set(hostname, promise);
+    return promise;
 }
 
 // --- Compression Helpers ---
-async function compressData(text) {
+async function compressData(text, contentType) {
     const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
-    return await new Response(stream).arrayBuffer();
-}
-
-function arrayBufferToBase64(buffer) {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-}
-
-// --- Blob/DataURL Helpers ---
-function blobToDataURL(blob) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(reader.error);
-        reader.readAsDataURL(blob);
-    });
+    const compressedBuffer = await new Response(stream).arrayBuffer();
+    return new Blob([compressedBuffer], { type: contentType });
 }
 
 function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
+    if (!bytes || bytes === 0) return '0 B';
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// --- Stats Batching System ---
+function queueStatUpdate(type, size = 0, url = null) {
+    if (type === 'hit') pendingStats.hits++;
+    if (type === 'miss') pendingStats.misses++;
+    pendingStats.bytesSaved += size;
+
+    if (type === 'hit' && size >= LARGE_ASSET_THRESHOLD && url) {
+        chrome.runtime.sendMessage({
+            type: 'largeAssetServed',
+            url: url,
+            size: size
+        }).catch(() => { });
+    }
+
+    if (!statWriteTimer) {
+        statWriteTimer = setTimeout(flushStats, 2000);
+    }
+}
+
+async function flushStats() {
+    statWriteTimer = null;
+    const toSave = { ...pendingStats };
+    pendingStats = { hits: 0, misses: 0, bytesSaved: 0 };
+
+    if (toSave.hits === 0 && toSave.misses === 0 && toSave.bytesSaved === 0) return;
+
+    try {
+        const data = await chrome.storage.local.get(['stats', 'totalSavings']);
+        const stats = data.stats || { hits: 0, misses: 0, bytesSaved: 0 };
+        const totalSavings = data.totalSavings || 0;
+
+        stats.hits += toSave.hits;
+        stats.misses += toSave.misses;
+        stats.bytesSaved += toSave.bytesSaved;
+
+        await chrome.storage.local.set({
+            stats: stats,
+            totalSavings: totalSavings + toSave.bytesSaved
+        });
+    } catch (e) {
+        // If it fails, put stats back into pending
+        pendingStats.hits += toSave.hits;
+        pendingStats.misses += toSave.misses;
+        pendingStats.bytesSaved += toSave.bytesSaved;
+        if (!statWriteTimer) statWriteTimer = setTimeout(flushStats, 2000);
+    }
+}
+
 // --- Initialization & Alarms ---
 chrome.runtime.onInstalled.addListener(() => {
     console.log("[Assets Cacher] onInstalled triggered");
     chrome.alarms.create('cacheEviction', { periodInMinutes: 60 });
-    chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+    chrome.alarms.create('keepAlive', { periodInMinutes: 1.0 }); // Min is 1 minute
     chrome.action.setBadgeBackgroundColor({ color: '#2d2d2d' });
 
     chrome.storage.local.get(['stats'], (data) => {
@@ -118,7 +181,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'cacheEviction') {
         evictOldCache();
     } else if (alarm.name === 'keepAlive') {
+        // Keeps the service worker alive by querying storage
         chrome.storage.local.get('_keepAlive');
+        // Force flush stats just in case SW is about to die
+        if (statWriteTimer) {
+            clearTimeout(statWriteTimer);
+            flushStats();
+        }
     }
 });
 
@@ -157,12 +226,15 @@ chrome.webRequest.onBeforeRequest.addListener(
                 // Lazy load this site's cache from IndexedDB
                 await ensureSiteLoaded(hostname);
 
+                // We update LRU here to keep the site active in memory
+                updateLRU(hostname);
+
                 const url = normalizeUrl(details.url);
                 const cachedMeta = siteCache[hostname]?.assets?.[url];
 
                 if (cachedMeta) {
-                    // Record hit asynchronously
-                    recordHit(cachedMeta.size, url);
+                    console.log(`[Assets Cacher] HIT: ${url.substring(0, 60)}...`);
+                    queueStatUpdate('hit', cachedMeta.size, url);
                 }
             } catch (e) {
                 // Ignore errors
@@ -172,32 +244,11 @@ chrome.webRequest.onBeforeRequest.addListener(
     { urls: ["<all_urls>"] }
 );
 
-async function recordHit(size, url) {
-    try {
-        const { stats } = await chrome.storage.local.get('stats');
-        const newStats = stats || { hits: 0, misses: 0, bytesSaved: 0 };
-        newStats.hits++;
-        newStats.bytesSaved += size;
-        await chrome.storage.local.set({ stats: newStats });
-
-        const { totalSavings } = await chrome.storage.local.get('totalSavings');
-        await chrome.storage.local.set({ totalSavings: (totalSavings || 0) + size });
-
-        if (size >= LARGE_ASSET_THRESHOLD) {
-            chrome.runtime.sendMessage({
-                type: 'largeAssetServed',
-                url: url,
-                size: size
-            }).catch(() => { });
-        }
-        console.log(`[Assets Cacher] HIT: ${url.substring(0, 60)}...`);
-    } catch (e) {
-        console.error("[Assets Cacher] Error recording hit:", e);
-    }
-}
-
 chrome.webRequest.onCompleted.addListener(
     (details) => {
+        // Optimization: skip if served directly from browser cache
+        if (details.fromCache) return;
+
         if (details.method !== "GET" || details.statusCode !== 200) return;
 
         const contentTypeHeader = details.responseHeaders?.find(h => h.name.toLowerCase() === 'content-type');
@@ -222,6 +273,7 @@ async function validateAndCacheAsset(details, contentType) {
 
         // Ensure site cache is loaded
         await ensureSiteLoaded(hostname);
+        updateLRU(hostname);
 
         const { site_prefs } = await chrome.storage.local.get('site_prefs');
         if ((site_prefs || {})[hostname]?.enabled === false) return;
@@ -238,33 +290,38 @@ async function validateAndCacheAsset(details, contentType) {
             return;
         }
 
-        const response = await fetch(details.url);
-        if (!response.ok) return;
+        let response;
+        try {
+            response = await fetch(details.url);
+            if (!response.ok) return;
+        } catch (e) {
+            // CORS or network failure
+            console.warn(`[Assets Cacher] Fetch failed for ${url.substring(0, 60)}... (CORS or Network Error)`);
+            return;
+        }
 
         const blob = await response.blob();
         const sizeInBytes = blob.size;
 
-        let dataUrl = await blobToDataURL(blob);
         let compressed = false;
-        let compressedData = null;
+        let finalBlob = blob;
 
         if (COMPRESSIBLE_TYPES.some(type => contentType.startsWith(type))) {
             try {
                 const text = await blob.text();
-                const compressedBuffer = await compressData(text);
-                compressedData = arrayBufferToBase64(compressedBuffer);
+                finalBlob = await compressData(text, contentType);
                 compressed = true;
-                console.log(`[Assets Cacher] Compressed ${url.substring(0, 60)}...: ${sizeInBytes} -> ${compressedBuffer.byteLength} bytes`);
+                console.log(`[Assets Cacher] Compressed ${url.substring(0, 60)}...: ${sizeInBytes} -> ${finalBlob.size} bytes`);
             } catch (e) {
                 console.warn("[Assets Cacher] Compression failed:", e);
+                finalBlob = blob;
             }
         }
 
         const newAsset = {
             url,
             initiator: hostname,
-            dataUrl,
-            compressedData,
+            blob: finalBlob, // Native Blob storage
             compressed,
             contentType,
             size: sizeInBytes,
@@ -294,11 +351,7 @@ async function validateAndCacheAsset(details, contentType) {
         };
         siteCache[hostname].totalSize += sizeInBytes;
 
-        // Track as a miss
-        const { stats } = await chrome.storage.local.get('stats');
-        const newStats = stats || { hits: 0, misses: 0, bytesSaved: 0 };
-        newStats.misses++;
-        await chrome.storage.local.set({ stats: newStats });
+        queueStatUpdate('miss');
 
         // Update badge
         if (tabId !== -1) updateActionBadge(tabId);
@@ -311,10 +364,8 @@ async function validateAndCacheAsset(details, contentType) {
 
 // --- Communication ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log("[Assets Cacher] Message received:", message.type);
-
+    // Return early if handling message promises
     handleMessage(message).then(response => {
-        console.log("[Assets Cacher] Sending response");
         sendResponse(response);
     }).catch(e => {
         console.error("[Assets Cacher] Message handler error:", e);
@@ -327,9 +378,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleMessage(message) {
     if (message.type === 'getState') {
         const { hostname } = message;
-
-        // Lazy load this site's cache
         await ensureSiteLoaded(hostname);
+
+        // Ensure pending stats are flushed so UI is accurate
+        if (statWriteTimer) {
+            clearTimeout(statWriteTimer);
+            await flushStats();
+        }
 
         const data = await chrome.storage.local.get(['site_prefs', 'totalSavings', 'stats']);
         const sitePrefs = data.site_prefs || {};
@@ -357,6 +412,10 @@ async function handleMessage(message) {
         await purgeSiteCache(message.hostname);
         return { success: true };
     } else if (message.type === 'getGlobalStats') {
+        if (statWriteTimer) {
+            clearTimeout(statWriteTimer);
+            await flushStats();
+        }
         const { totalSavings, stats } = await chrome.storage.local.get(['totalSavings', 'stats']);
         let totalItems = 0;
         let totalSize = 0;
@@ -380,7 +439,35 @@ async function handleMessage(message) {
         return allAssets;
     } else if (message.type === 'getAssetPreview') {
         const asset = await getAsset(message.url);
-        return { dataUrl: asset?.dataUrl || null };
+        // We will return true if asset exists. The UI will have to create Object URL
+        // Unfortunately MV3 background service workers cannot create Object URLs!
+        // So we will just pass the Blob to the popup if possible? No, we can't pass blobs across message channels.
+        // Oh wait, MV3 cannot use Blob URLs locally in SW anyway.
+        // But options page is a normal DOM page, it can create Object URLs!
+        return {
+            hasAsset: !!asset,
+            // Since we can't send Blob over chrome messages easily if it's too big, 
+            // actually we can send Blobs but maybe it's better to fetch from DB on the client side?
+            // Wait, we can't send Blob over postMessage? Actually chrome.runtime.sendMessage can send Blobs!
+            // BUT sending 1MB array down the message channel is slow.
+            // Wait, I can send the blob directly.
+            // However, previous version sent a Base64 string dataUrl! So string worked.
+            // Let's just return the asset. The popup/options can do what they need.
+        };
+    } else if (message.type === 'getAssetBlob') {
+        // We probably cannot send exact Blob object efficiently, but let's try.
+        // Wait, sending Blob over sendMessage works but might be serialized.
+        const asset = await getAsset(message.url);
+        if (asset && asset.blob) {
+            // Convert to base64 ONLY on demand for the preview!
+            const base64 = await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.readAsDataURL(asset.blob);
+            });
+            return { dataUrl: base64 };
+        }
+        return { dataUrl: null };
     } else if (message.type === 'purgeAll') {
         await purgeAllCache();
         return { success: true };
@@ -401,7 +488,7 @@ async function purgeSiteCache(hostname) {
             await deleteAsset(url);
         }
         delete siteCache[hostname];
-        loadedSites.delete(hostname);
+        siteLoadPromises.delete(hostname);
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tabs[0]) updateActionBadge(tabs[0].id);
     }
@@ -410,7 +497,7 @@ async function purgeSiteCache(hostname) {
 async function purgeAllCache() {
     await clearAllAssets();
     siteCache = {};
-    loadedSites.clear();
+    siteLoadPromises.clear();
     await chrome.storage.local.set({
         totalSavings: 0,
         stats: { hits: 0, misses: 0, bytesSaved: 0 }

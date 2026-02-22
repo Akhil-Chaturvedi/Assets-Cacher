@@ -1,3 +1,5 @@
+import { getAllAssets } from './db.js';
+
 const globalSavingsEl = document.getElementById('global-savings');
 const globalItemsEl = document.getElementById('global-items');
 const globalSizeEl = document.getElementById('global-size');
@@ -15,6 +17,7 @@ const modalClose = previewModal.querySelector('.close');
 
 let allAssets = [];
 let currentFilter = 'all';
+const objectUrls = new Map();
 
 function formatBytes(bytes) {
     if (bytes === 0) return '0 KB';
@@ -56,6 +59,14 @@ function getFileExt(url) {
     return ext.length <= 5 ? ext : 'FILE';
 }
 
+function getObjectUrl(asset) {
+    if (!asset.blob) return null;
+    if (objectUrls.has(asset.url)) return objectUrls.get(asset.url);
+    const url = URL.createObjectURL(asset.blob);
+    objectUrls.set(asset.url, url);
+    return url;
+}
+
 async function renderCacheGrid() {
     const filteredAssets = currentFilter === 'all'
         ? allAssets
@@ -81,23 +92,21 @@ async function renderCacheGrid() {
         item.dataset.size = asset.size;
 
         if (type === 'image') {
-            // Fetch preview from background
-            chrome.runtime.sendMessage({ type: 'getAssetPreview', url: asset.url }, (response) => {
-                if (response && response.dataUrl) {
-                    item.innerHTML = `
-                        <img src="${response.dataUrl}" alt="Cached image" loading="lazy">
-                        <div class="overlay">
-                            <span class="size">${formatBytes(asset.size)}</span>
-                        </div>
-                    `;
-                } else {
-                    item.className = 'cache-item non-image';
-                    item.innerHTML = `
-                        <span class="file-icon">🖼️</span>
-                        <span class="file-ext">${getFileExt(asset.url)}</span>
-                    `;
-                }
-            });
+            const url = getObjectUrl(asset);
+            if (url) {
+                item.innerHTML = `
+                    <img src="${url}" alt="Cached image" loading="lazy">
+                    <div class="overlay">
+                        <span class="size">${formatBytes(asset.size)}</span>
+                    </div>
+                `;
+            } else {
+                item.className = 'cache-item non-image';
+                item.innerHTML = `
+                    <span class="file-icon">🖼️</span>
+                    <span class="file-ext">${getFileExt(asset.url)}</span>
+                `;
+            }
         } else {
             item.innerHTML = `
                 <span class="file-icon">${getFileIcon(type)}</span>
@@ -114,14 +123,13 @@ function openPreview(asset) {
     const type = getAssetType(asset.contentType, asset.url);
 
     if (type === 'image') {
-        chrome.runtime.sendMessage({ type: 'getAssetPreview', url: asset.url }, (response) => {
-            if (response && response.dataUrl) {
-                previewImage.src = response.dataUrl;
-                previewUrl.textContent = asset.url;
-                previewSize.textContent = `${formatBytes(asset.size)} • Cached ${new Date(asset.cachedOn).toLocaleString()}`;
-                previewModal.classList.add('active');
-            }
-        });
+        const url = getObjectUrl(asset);
+        if (url) {
+            previewImage.src = url;
+            previewUrl.textContent = asset.url;
+            previewSize.textContent = `${formatBytes(asset.size)} • Cached ${new Date(asset.cachedOn).toLocaleString()}`;
+            previewModal.classList.add('active');
+        }
     } else {
         // For non-images, just show URL info
         previewImage.src = '';
@@ -152,7 +160,7 @@ filterTabs.forEach(tab => {
 });
 
 async function populateData() {
-    // Populate stats
+    // Populate stats from background
     const stats = await chrome.runtime.sendMessage({ type: 'getGlobalStats' });
     if (stats) {
         globalSavingsEl.textContent = formatBytes(stats.totalSavings);
@@ -160,8 +168,13 @@ async function populateData() {
         globalSizeEl.textContent = formatBytes(stats.totalSize);
     }
 
-    // Get all assets
-    allAssets = await chrome.runtime.sendMessage({ type: 'getAllAssets' }) || [];
+    // Load assets directly from IndexedDB instead of messaging!
+    try {
+        allAssets = await getAllAssets();
+    } catch (e) {
+        console.error("Failed to load assets from DB:", e);
+        allAssets = [];
+    }
 
     // Render grid
     renderCacheGrid();
@@ -194,9 +207,10 @@ async function populateData() {
 
 purgeAllButton.addEventListener('click', () => {
     if (confirm('Are you sure you want to delete all cached data? This cannot be undone.')) {
-        chrome.runtime.sendMessage({ type: 'purgeAll' });
-        alert('All cache has been cleared.');
-        location.reload();
+        chrome.runtime.sendMessage({ type: 'purgeAll' }, () => {
+            alert('All cache has been cleared.');
+            location.reload();
+        });
     }
 });
 
