@@ -1,7 +1,5 @@
 // --- Background: Cache hit/miss monitoring ---
 
-let siteStats = {};
-
 console.log("[Assets Cacher] Monitor starting.");
 
 // -- Stats batching --
@@ -58,6 +56,16 @@ chrome.runtime.onInstalled.addListener(() => {
     });
 });
 
+// -- Utility: Hash string to int for DNR rules --
+function hashStringToInt(str) {
+    let hash = 5381;
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    }
+    // Ensure positive integer for DNR rule ID (DNR ids must be >= 1)
+    return Math.abs(hash) + 10000;
+}
+
 // -- Per-site exceptions via dynamic DNR rules --
 const ASSET_TYPES = ["stylesheet", "script", "image", "font", "media", "object"];
 
@@ -66,22 +74,29 @@ async function applySitePreferences() {
     if (!site_prefs) return;
 
     const disabledDomains = [];
+    const ruleIdsToRemove = [];
+
+    // Collect all disabled domains and their deterministic hashed IDs
     for (const [hostname, data] of Object.entries(site_prefs)) {
-        if (data.enabled === false) disabledDomains.push(hostname);
+        const ruleId = hashStringToInt(hostname);
+        ruleIdsToRemove.push(ruleId); // We always remove to refresh
+        if (data.enabled === false) {
+            disabledDomains.push({ hostname: hostname, id: ruleId });
+        }
     }
 
     const rulesConfig = {
-        removeRuleIds: [2],
+        removeRuleIds: ruleIdsToRemove,
         addRules: []
     };
 
-    if (disabledDomains.length > 0) {
+    for (const site of disabledDomains) {
         rulesConfig.addRules.push({
-            id: 2,
+            id: site.id,
             priority: 2,
-            action: { type: "allow" },
+            action: { type: "allow" }, // Bypasses the strict rules.json injection
             condition: {
-                requestDomains: disabledDomains,
+                requestDomains: [site.hostname],
                 resourceTypes: ASSET_TYPES
             }
         });
@@ -100,12 +115,49 @@ chrome.storage.onChanged.addListener((changes, area) => {
     }
 });
 
+// -- Session Memory (Survives SW sleep, dies on browser close) --
+async function getHostStats(hostname) {
+    const data = await chrome.storage.session.get('siteStats');
+    const allStats = data.siteStats || {};
+    return allStats[hostname] || { items: 0, size: 0 };
+}
+
+async function updateHostStats(hostname, size) {
+    const data = await chrome.storage.session.get('siteStats');
+    const allStats = data.siteStats || {};
+    if (!allStats[hostname]) allStats[hostname] = { items: 0, size: 0 };
+
+    allStats[hostname].items++;
+    allStats[hostname].size += size;
+
+    await chrome.storage.session.set({ siteStats: allStats });
+    return allStats[hostname];
+}
+
+// Memory of Exact Asset Sizes (Because fromCache drops Content-Length)
+async function getOriginalAssetSize(url) {
+    const data = await chrome.storage.session.get('assetSizes');
+    return (data.assetSizes || {})[url];
+}
+
+async function setOriginalAssetSize(url, size) {
+    const data = await chrome.storage.session.get('assetSizes');
+    const assetSizes = data.assetSizes || {};
+    // Cap memory usage - naive GC if too large
+    if (Object.keys(assetSizes).length > 2000) {
+        const keys = Object.keys(assetSizes);
+        for (let i = 0; i < 500; i++) delete assetSizes[keys[i]];
+    }
+    assetSizes[url] = size;
+    await chrome.storage.session.set({ assetSizes });
+}
+
 // -- Badge --
-function updateActionBadge(tabId, hostname) {
+async function updateActionBadge(tabId, hostname) {
     if (!hostname) return;
     try {
-        const count = siteStats[hostname] ? siteStats[hostname].items : 0;
-        chrome.action.setBadgeText({ tabId, text: count > 0 ? count.toString() : '' });
+        const stats = await getHostStats(hostname);
+        chrome.action.setBadgeText({ tabId, text: stats.items > 0 ? stats.items.toString() : '' });
     } catch (e) { }
 }
 
@@ -124,34 +176,52 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     } catch (e) { }
 });
 
-// -- Cache hit/miss monitoring --
+// -- Cache hit/miss monitoring (Honest Analytics) --
 chrome.webRequest.onCompleted.addListener(
-    (details) => {
+    async (details) => {
         if (details.method !== "GET" || details.statusCode !== 200) return;
 
         let hostname;
-        try {
-            hostname = new URL(details.initiator || details.url).hostname;
-        } catch (e) { return; }
-
-        if (!siteStats[hostname]) {
-            siteStats[hostname] = { items: 0, size: 0 };
-        }
+        try { hostname = new URL(details.initiator || details.url).hostname; } catch (e) { return; }
 
         if (details.fromCache) {
-            let size = 0;
-            const clHeader = details.responseHeaders?.find(
-                h => h.name.toLowerCase() === 'content-length'
+            // Chrome's disk cache preserves headers we injected via DNR!
+            const forcedHeader = details.responseHeaders?.find(
+                h => h.name.toLowerCase() === 'x-assets-cacher-forced'
             );
-            if (clHeader && clHeader.value) size = parseInt(clHeader.value, 10);
 
-            queueStatUpdate('hit', size);
-            siteStats[hostname].items++;
-            siteStats[hostname].size += size;
+            // If the cache hit contains our custom header, we forced it. (Solves Stolen Valor)
+            if (forcedHeader) {
+                let trueSize = await getOriginalAssetSize(details.url);
 
-            if (details.tabId !== -1) updateActionBadge(details.tabId, hostname);
+                // If undefined, it's from a previous browser session.
+                // If 0, it was chunked-transfer-encoded on the miss. 
+                // We fallback to 30KB to continue logging the hit natively.
+                if (trueSize === undefined || trueSize === 0) {
+                    trueSize = 30 * 1024;
+                }
+
+                queueStatUpdate('hit', trueSize);
+                await updateHostStats(hostname, trueSize);
+                if (details.tabId !== -1) updateActionBadge(details.tabId, hostname);
+            }
         } else {
-            queueStatUpdate('miss', 0);
+            // Miss - Check if OUR extension injected headers on this response
+            const forcedHeader = details.responseHeaders?.find(
+                h => h.name.toLowerCase() === 'x-assets-cacher-forced'
+            );
+
+            if (forcedHeader) {
+                // We forced this! Store its precise size so we know how much we save on the next visit.
+                let size = 0;
+                const clHeader = details.responseHeaders?.find(
+                    h => h.name.toLowerCase() === 'content-length'
+                );
+                if (clHeader && clHeader.value) size = parseInt(clHeader.value, 10);
+
+                await setOriginalAssetSize(details.url, size);
+                queueStatUpdate('miss', 0);
+            }
         }
     },
     { urls: ["<all_urls>"] },
@@ -175,7 +245,7 @@ async function handleMessage(message) {
 
         const data = await chrome.storage.local.get(['site_prefs', 'totalSavings', 'stats']);
         const isEnabled = data.site_prefs?.[hostname]?.enabled !== false;
-        const localStats = siteStats[hostname] || { items: 0, size: 0 };
+        const localStats = await getHostStats(hostname);
 
         return {
             isEnabled,
@@ -200,12 +270,18 @@ async function handleMessage(message) {
             await flushStats();
         }
         const { totalSavings, stats } = await chrome.storage.local.get(['totalSavings', 'stats']);
+
+        // Sum up session stats from storage
+        const sessionData = await chrome.storage.session.get('siteStats');
+        const allStats = sessionData.siteStats || {};
+
         let sessionItems = 0;
         let sessionSize = 0;
-        for (const host in siteStats) {
-            sessionItems += siteStats[host].items;
-            sessionSize += siteStats[host].size;
+        for (const host in allStats) {
+            sessionItems += allStats[host].items;
+            sessionSize += allStats[host].size;
         }
+
         return {
             totalSavings: totalSavings || 0,
             totalItems: sessionItems,
@@ -214,11 +290,16 @@ async function handleMessage(message) {
         };
 
     } else if (message.type === 'purgeSiteCache') {
-        delete siteStats[message.hostname];
+        // Clear session tracking
+        const data = await chrome.storage.session.get('siteStats');
+        if (data.siteStats && data.siteStats[message.hostname]) {
+            delete data.siteStats[message.hostname];
+            await chrome.storage.session.set({ siteStats: data.siteStats });
+        }
         return { success: true };
 
     } else if (message.type === 'purgeAll') {
-        siteStats = {};
+        await chrome.storage.session.remove(['siteStats', 'assetSizes']);
         await chrome.storage.local.set({
             totalSavings: 0,
             stats: { hits: 0, misses: 0, bytesSaved: 0 }

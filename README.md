@@ -1,38 +1,51 @@
 # Assets Cacher
 
-A Chrome extension (Manifest V3) that reduces bandwidth consumption by overriding HTTP cache headers on static assets. It injects long-lived `Cache-Control` directives into server responses, forcing Chrome's native disk cache to retain stylesheets, scripts, images, fonts, and media files across sessions.
+A Chrome extension (Manifest V3) that reduces bandwidth consumption by overriding HTTP cache headers on static assets. It uses `declarativeNetRequest` to intercept response headers on provably-static files and replace the server's conservative (or absent) `Cache-Control` value with a long-lived one, causing Chrome's native disk cache to retain the file across sessions.
 
 ---
 
 ## How it works
 
-Most web servers return conservative cache headers (`Cache-Control: no-cache`, `max-age=0`, or `private`) on static assets, causing the browser to revalidate or re-download them on every page load. This extension uses Chrome's `declarativeNetRequest` API to intercept response headers and replace the `Cache-Control` value with:
+Most web servers return conservative cache headers (`Cache-Control: no-cache`, `max-age=0`, or `private`) on static assets, causing the browser to revalidate or re-download them on every page load. This extension uses Chrome's `declarativeNetRequest` API with a `modifyHeaders` action to replace `Cache-Control` on qualifying assets with:
 
 ```
-Cache-Control: public, max-age=31536000, immutable
+Cache-Control: public, max-age=31536000
 ```
 
-This tells the browser to treat the asset as permanently cacheable for one year. Chrome's native HTTP cache engine (which operates at the C++ level, far more efficiently than any JavaScript-based solution) stores the file on disk and serves it locally on subsequent requests — with zero network activity.
+A second header is injected simultaneously:
+
+```
+X-Assets-Cacher-Forced: true
+```
+
+This acts as a fingerprint. On the initial download (cache miss), `background.js` detects this header and stores the asset's exact `Content-Length` in `chrome.storage.session`. On subsequent visits, when Chrome serves the asset from disk (`fromCache: true`), the extension looks up the stored size and credits exactly those bytes as bandwidth saved. This prevents the extension from taking credit for files that Chrome was already caching natively.
 
 ### Request flow
 
 ```
 First visit:
-  Browser --> Network --> Server responds with asset
-  DNR rule overwrites Cache-Control header to max-age=1yr
-  Chrome disk cache stores asset locally
+  Browser -> Network -> Server responds with asset
+  URL matches static regex (e.g. ends in .js, .css, .png):
+    DNR injects: Cache-Control: public, max-age=31536000
+    DNR injects: X-Assets-Cacher-Forced: true
+  background.js sees miss + fingerprint -> stores exact Content-Length in session
+  Chrome disk cache stores asset
 
 Subsequent visits:
-  Browser --> Chrome disk cache (served from disk, 0 bytes transferred)
-  Extension monitors fromCache flag to track bandwidth savings
+  Browser -> Chrome disk cache (0 bytes transferred)
+  background.js sees fromCache: true -> looks up stored size -> logs as savings
 ```
+
+### Targeting rules
+
+The extension does not blindly apply the override to all requests. `rules.json` is scoped by DNR `resourceTypes` to only target standard static formats (stylesheets, scripts, images, fonts, media). An `excludedRegexFilter` using strict word boundaries (`\b`) prevents the rule from firing on paths containing patterns like `/captcha/`, `/analytics/`, `/auth/`, `token=`, `.php`, and similar indicators of dynamic or authenticated content.
 
 ### Why not IndexedDB or Service Worker interception?
 
 Earlier iterations of this extension attempted to cache assets in IndexedDB and serve them via a Service Worker fetch handler, using DNR redirects to route requests through an internal proxy endpoint.
 
 This approach failed for two reasons:
-1. **Relative path corruption** — Redirecting a CDN-hosted CSS file to `chrome-extension://id/proxy.html` breaks all relative `url()` references inside the stylesheet, since the browser resolves them against the extension origin instead of the original CDN.
+1. **Relative path corruption** — Redirecting a CDN-hosted CSS file to `chrome-extension://id/proxy.html` breaks all relative `url()` references inside the stylesheet. The browser resolves them against the extension origin instead of the original CDN.
 2. **Double-fetch overhead** — The `webRequest.onCompleted` API fires after the browser has already consumed the response body. To populate IndexedDB, the extension had to issue a second `fetch()` for every new asset, doubling bandwidth on first visits.
 
 The header-override approach avoids both problems entirely. The browser handles storage, serving, and eviction natively.
@@ -41,12 +54,11 @@ The header-override approach avoids both problems entirely. The browser handles 
 
 ## Features
 
-- **Header injection** — Static DNR rule overrides `Cache-Control` on all static asset types (stylesheets, scripts, images, fonts, media).
-- **Per-site disable** — Toggle caching off for specific hostnames via the popup. Implemented as a dynamic DNR `allow` rule that bypasses the static header override.
-- **Bandwidth tracking** — Monitors `webRequest.onCompleted` events and checks `details.fromCache` to count cache hits and estimate bytes saved.
-- **Session statistics** — Popup displays per-site hit count, miss count, hit rate, and cumulative bandwidth saved.
-- **Options dashboard** — Shows aggregate session metrics (total hits, total bytes saved).
-- **Hard refresh support** — `Ctrl+Shift+R` bypasses the disk cache natively (standard browser behavior), re-downloads all assets, and the overridden headers cause them to be re-cached automatically.
+- **Targeted header injection** — `rules.json` scopes caching strictly by asset type and explicitly excludes captcha, analytics, tracking, and authenticated endpoints using strict word boundary exclusions to prevent false positives.
+- **Honest bandwidth accounting** — Each forced asset is fingerprinted with `X-Assets-Cacher-Forced`. Because Chrome preserves injected headers in the disk cache, `background.js` natively detects this header on cache hits. Bandwidth savings are counted only for fingerprinted assets.
+- **Ephemeral-safe session memory** — MV3 Service Workers are killed by Chrome after ~30 seconds of inactivity. Session counters live in `chrome.storage.session`, which survives SW restarts but resets when the browser closes.
+- **Per-site disable** — Toggle caching off for a hostname from the popup. Implemented as a dynamic DNR `allow` rule with a deterministic rule ID derived by hashing the hostname, preventing rule ID collisions.
+- **Hard refresh passthrough** — `Ctrl+Shift+R` bypasses the disk cache natively. The extension re-injects headers on the fresh download, re-caching automatically.
 
 ---
 
@@ -55,11 +67,11 @@ The header-override approach avoids both problems entirely. The browser handles 
 ```
 Assets-Cacher/
   manifest.json      MV3 manifest with declarativeNetRequest ruleset
-  rules.json         Static DNR rule: override Cache-Control on static assets
-  background.js      Service worker: cache hit/miss monitoring, per-site preferences, messaging
-  popup.html/.js     Extension popup: per-site stats, enable/disable toggle
-  popup.css          Shared styles for popup and options page
-  options.html/.js   Options page: aggregate statistics dashboard
+  rules.json         Static DNR rule: regexFilter-based Cache-Control injection
+  background.js      Service worker: fingerprint tracking, session stats, per-site DNR exceptions
+  popup.html/.js     Per-site stats, enable/disable toggle
+  popup.css          Styles shared by popup and options page
+  options.html/.js   Aggregate bandwidth dashboard
   icons/             Extension icons (16/48/128px)
 ```
 
@@ -74,31 +86,32 @@ Assets-Cacher/
 
 ## Usage
 
-1. Browse normally. The extension silently overrides cache headers on all static assets.
-2. Click the extension icon to view per-site statistics and toggle caching.
+1. Browse normally. The extension silently overrides cache headers on qualifying static assets.
+2. Click the extension icon to view per-site hit count and bandwidth saved, and to toggle caching.
 3. Use `Ctrl+Shift+R` to force a fresh download if a site's assets appear stale.
-4. Open the options page for aggregate bandwidth metrics.
+4. Open the options page for aggregate session metrics.
 
 ---
 
 ## Permissions
 
-| Permission | Usage |
+| Permission | Reason |
 |---|---|
-| `storage` | Persist hit/miss statistics and per-site preferences |
-| `declarativeNetRequest` | Apply static header-override rules and dynamic per-site exceptions |
-| `declarativeNetRequestFeedback` | Required for dynamic rule updates |
-| `webRequest` | Monitor `onCompleted` events to detect cache hits via `fromCache` |
-| `tabs` | Read active tab URL for hostname-based badge and popup state |
+| `storage` | Persist cumulative bandwidth stats and per-site preferences |
+| `declarativeNetRequest` | Apply the static header-override rule via `rules.json` |
+| `declarativeNetRequestFeedback` | Required to add and remove dynamic per-site exception rules |
+| `webRequest` | Observe `onCompleted` events to detect `fromCache` hits and inspect the `X-Assets-Cacher-Forced` fingerprint |
+| `tabs` | Read active tab URL for per-site badge and popup state |
 | `<all_urls>` (host) | Apply header overrides across all origins |
 
 ---
 
 ## Limitations
 
-- **Cache eviction is browser-managed.** Chrome's disk cache has a finite size (typically ~300MB–2GB depending on available disk space). When full, Chrome evicts least-recently-used entries automatically. The extension has no control over this.
-- **Dynamic URLs.** Assets with cache-busting query strings (`?v=abc123`) are treated as unique URLs by the browser cache. If a site changes the hash on every deploy, the old cached version becomes orphaned and the new one is downloaded fresh.
-- **HTML is excluded.** Only static asset types (stylesheets, scripts, images, fonts, media) are affected. HTML documents retain their original cache headers to avoid serving stale page content or breaking authentication flows.
+- **Cache eviction is browser-managed.** Chrome's disk cache has a finite quota (typically a few hundred MB to a few GB depending on available disk space). When full, Chrome evicts least-recently-used entries. The extension has no control over this.
+- **Un-hashed filenames.** If a site updates `app.js` without a cache-busting hash, the user gets the old version for up to a year unless they hard-refresh (`Ctrl+Shift+R`). This is a trade-off of aggressive caching. Sites that use file hashing (`app.abc123.js`) are unaffected.
+- **Session memory resets on browser close.** `chrome.storage.session` is cleared when the browser closes. The cumulative `totalSavings` counter in `chrome.storage.local` persists, but per-site hit counts reset.
+- **Regex coverage is not exhaustive.** The `excludedRegexFilter` excludes known dynamic patterns, but novel dynamic endpoints that happen to end in a static extension (e.g., `/api/data.js`) will be affected. Such patterns can be excluded by disabling the extension for that hostname via the popup toggle.
 
 ## License
 

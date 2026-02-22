@@ -8,12 +8,18 @@
                 {
                     "header": "Cache-Control",
                     "operation": "set",
-                    "value": "public, max-age=31536000, immutable"
+                    "value": "public, max-age=31536000"
+                },
+                {
+                    "header": "X-Assets-Cacher-Forced",
+                    "operation": "set",
+                    "value": "true"
                 }
             ]
         },
         "condition": {
             "urlFilter": "*",
+            "excludedRegexFilter": "(?i)\\b(captcha|analytics|telemetry|beacon|pixel|track|auth|login|session|csrf|nonce|token|sso)\\b|\\.(php|aspx|jsp|cgi|py)$",
             "resourceTypes": [
                 "stylesheet",
                 "script",

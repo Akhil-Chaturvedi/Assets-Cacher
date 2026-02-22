@@ -121,7 +121,7 @@
 
         <div class="header">
             <h1>Cache Monitor</h1>
-            <p>Bandwidth metrics tracked by observing native cache behavior.</p>
+            <p>Bandwidth saved by assets this extension forced into cache. Resets when the browser closes.</p>
         </div>
 
         <div class="stats-grid">
@@ -140,10 +140,13 @@
         </div>
 
         <div class="info-box">
-            <strong>How it works:</strong> The extension overrides <code>Cache-Control</code> response headers
-            on static assets to <code>max-age=31536000, immutable</code>. Chrome's native disk cache
-            retains the files and serves them locally on subsequent requests. Statistics here are
-            derived from the <code>fromCache</code> flag on <code>webRequest.onCompleted</code> events.
+            <strong>How metrics are counted:</strong> When the extension overrides a response
+            (<code>Cache-Control: public, max-age=31536000</code>), it also injects
+            <code>X-Assets-Cacher-Forced: true</code>. On the initial download, the exact
+            <code>Content-Length</code> is recorded in session memory against that URL.
+            On subsequent cache hits, the stored size is credited as bandwidth saved.
+            Only assets this extension fingerprinted are counted — native browser cache hits
+            for assets with already-correct server headers are not included.
         </div>
 
         <div class="section">
