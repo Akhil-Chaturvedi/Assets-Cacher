@@ -6,11 +6,13 @@ A Chrome extension (Manifest V3) that reduces bandwidth consumption by overridin
 
 ## How it works
 
-Most web servers return conservative cache headers (`Cache-Control: no-cache`, `max-age=0`, or `private`) on static assets, causing the browser to revalidate or re-download them on every page load. This extension uses Chrome's `declarativeNetRequest` API with a `modifyHeaders` action to replace `Cache-Control` on qualifying assets with:
+Most web servers return conservative cache headers (`Cache-Control: no-cache`, `max-age=0`, or `private`) on static assets, causing the browser to revalidate or re-download them on every page load. This extension uses Chrome's `declarativeNetRequest` API with a `modifyHeaders` action to safely replace `Cache-Control` on qualifying assets with:
 
 ```
-Cache-Control: public, max-age=31536000
+Cache-Control: max-age=31536000
 ```
+
+*Note: The `public` directive is intentionally omitted to respect standard private caching boundaries on authenticated CDNs, while still forcing local disk retention.*
 
 A second header is injected simultaneously:
 
@@ -28,7 +30,7 @@ First visit:
   URL matches static regex (e.g. ends in .js, .css, .png):
     DNR injects: Cache-Control: public, max-age=31536000
     DNR injects: X-Assets-Cacher-Forced: true
-  background.js sees miss + fingerprint -> stores exact Content-Length in session
+  background.js sees miss + fingerprint -> stores exact Content-Length in an in-memory Map (synced to local storage)
   Chrome disk cache stores asset
 
 Subsequent visits:
@@ -38,7 +40,7 @@ Subsequent visits:
 
 ### Targeting rules
 
-The extension does not blindly apply the override to all requests. `rules.json` is scoped by DNR `resourceTypes` to only target standard static formats (stylesheets, scripts, images, fonts, media). An `excludedRegexFilter` using strict word boundaries (`\b`) prevents the rule from firing on paths containing patterns like `/captcha/`, `/analytics/`, `/auth/`, `token=`, `.php`, and similar indicators of dynamic or authenticated content.
+To prevent CPU taxation and strictly avoid breaking dynamic authenticated endpoints, the extension does not apply the override to all requests. `rules.json` uses a highly optimized `regexFilter` mapped to DNR `resourceTypes`. It exclusively targets URLs ending exactly in known static extensions (`.js`, `.css`, `.woff2`, `.ttf`, `.png`, `.jpg`, `.svg`, `.mp4`, etc.). Extensionless URLs are ignored by design.
 
 ### Why not IndexedDB or Service Worker interception?
 
@@ -54,10 +56,10 @@ The header-override approach avoids both problems entirely. The browser handles 
 
 ## Features
 
-- **Targeted header injection** — `rules.json` scopes caching strictly by asset type and explicitly excludes captcha, analytics, tracking, and authenticated endpoints using strict word boundary exclusions to prevent false positives.
-- **Honest bandwidth accounting** — Each forced asset is fingerprinted with `X-Assets-Cacher-Forced`. Because Chrome preserves injected headers in the disk cache, `background.js` natively detects this header on cache hits. Bandwidth savings are counted only for fingerprinted assets.
-- **Ephemeral-safe session memory** — MV3 Service Workers are killed by Chrome after ~30 seconds of inactivity. Session counters live in `chrome.storage.session`, which survives SW restarts but resets when the browser closes.
-- **Per-site disable** — Toggle caching off for a hostname from the popup. Implemented as a dynamic DNR `allow` rule with a deterministic rule ID derived by hashing the hostname, preventing rule ID collisions.
+- **Targeted header injection** — `rules.json` scopes caching strictly by exact static asset extensions (`.js`, `.png`, etc.) avoiding expensive multi-boundary regex filters and ensuring zero interference with dynamic endpoints.
+- **Honest bandwidth accounting** — Each forced asset is fingerprinted with `X-Assets-Cacher-Forced`. Because Chrome preserves injected headers in the disk cache, `background.js` natively detects this header on cache hits. Known asset metrics are stored in `chrome.storage.local`, perfectly surviving browser restarts. (If the server obscures the file size via chunked-transfer encoding, a logical estimation is applied based on the file extension).
+- **Lock-free architecture** — Network hits modify memory `Map` instances synchronously (ensuring a 0ms O(1) delay on the Service Worker thread) with strict LRU (Least Recently Used) automatic garbage collection. A central debouncing daemon flushes the memory state to `chrome.storage` and updates the UI badge asynchronously every 2 seconds, preventing browser I/O thrashing.
+- **Per-site disable** — Toggle caching off for a hostname from the popup. Implemented dynamically through an auto-incrementing Rule ID allocator (starting at ID 10000) stored in `chrome.storage.local`, guaranteeing zero DNR rule collisions.
 - **Hard refresh passthrough** — `Ctrl+Shift+R` bypasses the disk cache natively. The extension re-injects headers on the fresh download, re-caching automatically.
 
 ---

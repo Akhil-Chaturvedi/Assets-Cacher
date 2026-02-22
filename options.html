@@ -144,6 +144,8 @@
             (<code>Cache-Control: public, max-age=31536000</code>), it also injects
             <code>X-Assets-Cacher-Forced: true</code>. On the initial download, the exact
             <code>Content-Length</code> is recorded in session memory against that URL.
+            (If the server obscures the file size via chunked-transfer encoding, a logical
+            estimation is applied based on the file extension e.g., 50KB for scripts).
             On subsequent cache hits, the stored size is credited as bandwidth saved.
             Only assets this extension fingerprinted are counted — native browser cache hits
             for assets with already-correct server headers are not included.
