@@ -18,7 +18,7 @@
             ]
         },
         "condition": {
-            "regexFilter": "\\.(js|css|woff2?|ttf|otf|eot|png|jpeg|jpg|gif|svg|webp|ico|mp4|webm|ogg|mp3|wav)(\\?.*)?$",
+            "regexFilter": "(?i)\\.(js|css|woff2?|ttf|otf|eot|png|jpeg|jpg|gif|svg|webp|ico|mp4|webm|ogg|mp3|wav)(\\?.*)?$",
             "resourceTypes": [
                 "stylesheet",
                 "script",

@@ -40,7 +40,7 @@ Subsequent visits:
 
 ### Targeting rules
 
-To prevent CPU taxation and strictly avoid breaking dynamic authenticated endpoints, the extension does not apply the override to all requests. `rules.json` uses a highly optimized `regexFilter` mapped to DNR `resourceTypes`. It exclusively targets URLs ending exactly in known static extensions (`.js`, `.css`, `.woff2`, `.ttf`, `.png`, `.jpg`, `.svg`, `.mp4`, etc.). Extensionless URLs are ignored by design.
+To prevent CPU taxation and strictly avoid breaking dynamic authenticated endpoints, the extension does not apply the override to all requests. `rules.json` uses a highly optimized `regexFilter` mapped to DNR `resourceTypes`. It exclusively targets URLs ending exactly in known static extensions `(?i)` case-insensitively (`.js`, `.css`, `.woff2`, `.ttf`, `.png`, `.jpg`, `.svg`, `.mp4`, etc.). Extensionless URLs are ignored by design.
 
 ### Why not IndexedDB or Service Worker interception?
 
@@ -58,7 +58,7 @@ The header-override approach avoids both problems entirely. The browser handles 
 
 - **Targeted header injection** — `rules.json` scopes caching strictly by exact static asset extensions (`.js`, `.png`, etc.) avoiding expensive multi-boundary regex filters and ensuring zero interference with dynamic endpoints.
 - **Honest bandwidth accounting** — Each forced asset is fingerprinted with `X-Assets-Cacher-Forced`. Because Chrome preserves injected headers in the disk cache, `background.js` natively detects this header on cache hits. Known asset metrics are stored in `chrome.storage.local`, perfectly surviving browser restarts. (If the server obscures the file size via chunked-transfer encoding, a logical estimation is applied based on the file extension).
-- **Lock-free architecture** — Network hits modify memory `Map` instances synchronously (ensuring a 0ms O(1) delay on the Service Worker thread) with strict LRU (Least Recently Used) automatic garbage collection. A central debouncing daemon flushes the memory state to `chrome.storage` and updates the UI badge asynchronously every 2 seconds, preventing browser I/O thrashing.
+- **Lock-free architecture** — Network hits modify memory `Map` instances synchronously (ensuring a 0ms O(1) delay on the Service Worker thread) with strict LRU (Least Recently Used) automatic garbage collection. To prevent early-wake race conditions, network handlers queue dynamically behind an asynchronous storage hydration Promise array. A central debouncing daemon flushes the memory state to `chrome.storage` asynchronously every 2 seconds, utilizing `isDirty` flags to guarantee zero I/O disk thrashing during idle phases.
 - **Per-site disable** — Toggle caching off for a hostname from the popup. Implemented dynamically through an auto-incrementing Rule ID allocator (starting at ID 10000) stored in `chrome.storage.local`, guaranteeing zero DNR rule collisions.
 - **Hard refresh passthrough** — `Ctrl+Shift+R` bypasses the disk cache natively. The extension re-injects headers on the fresh download, re-caching automatically.
 
