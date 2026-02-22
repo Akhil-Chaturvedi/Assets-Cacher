@@ -9,8 +9,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const cacheHitsEl = document.getElementById('cache-hits');
     const cacheMissesEl = document.getElementById('cache-misses');
     const hitRateEl = document.getElementById('hit-rate');
-    const toastEl = document.getElementById('toast');
-    const toastMessageEl = document.getElementById('toast-message');
     const container = document.querySelector('.container');
 
     let currentHostname = '';
@@ -21,18 +19,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const sizes = ['Bytes', 'KB', 'MB', 'GB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }
-
-    function showToast(message, duration = 3000) {
-        toastMessageEl.textContent = message;
-        toastEl.classList.remove('hidden', 'fade-out');
-
-        setTimeout(() => {
-            toastEl.classList.add('fade-out');
-            setTimeout(() => {
-                toastEl.classList.add('hidden');
-            }, 300);
-        }, duration);
     }
 
     function updateUI(state) {
@@ -50,7 +36,6 @@ document.addEventListener('DOMContentLoaded', () => {
         savingsSizeEl.textContent = formatBytes(state.savings);
         purgeButton.disabled = state.itemCount === 0;
 
-        // Update hit/miss stats
         if (state.stats) {
             cacheHitsEl.textContent = state.stats.hits;
             cacheMissesEl.textContent = state.stats.misses;
@@ -61,14 +46,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // Listen for large asset notifications from background
-    chrome.runtime.onMessage.addListener((message) => {
-        if (message.type === 'largeAssetServed') {
-            showToast(`⚡ Saved ${formatBytes(message.size)} from cache!`);
-        }
-    });
-
-    // Get current tab and initialize UI
+    // Initialize
     container.classList.add('loading');
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -91,7 +69,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 container.innerHTML = `
                     <div class="header">
                         <h3>Assets Cacher</h3>
-                        <p>Caching is not available for internal <code>${url.protocol}</code> pages.</p>
+                        <p>Caching is not available for <code>${url.protocol}</code> pages.</p>
                     </div>
                 `;
             }
@@ -101,7 +79,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // --- Event Listeners ---
     enabledSwitch.addEventListener('change', () => {
         container.classList.add('loading');
         chrome.runtime.sendMessage({

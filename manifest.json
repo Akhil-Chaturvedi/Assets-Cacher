@@ -1,31 +1,29 @@
 {
   "manifest_version": 3,
   "name": "Assets Cacher",
-  "version": "1.0",
-  "description": "Caches frequently downloaded assets to save bandwidth, with per-site controls.",
+  "version": "2.0",
+  "description": "Overrides HTTP cache headers on static assets to reduce bandwidth consumption.",
   "permissions": [
     "storage",
     "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
     "webRequest",
-    "tabs",
-    "alarms"
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "proxy.html"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    }
-  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html"
