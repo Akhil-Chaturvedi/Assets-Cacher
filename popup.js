@@ -6,6 +6,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const purgeButton = document.getElementById('purge-button');
     const savingsSizeEl = document.getElementById('savings-size');
     const optionsLink = document.getElementById('options-link');
+    const cacheHitsEl = document.getElementById('cache-hits');
+    const cacheMissesEl = document.getElementById('cache-misses');
+    const hitRateEl = document.getElementById('hit-rate');
+    const toastEl = document.getElementById('toast');
+    const toastMessageEl = document.getElementById('toast-message');
+    const container = document.querySelector('.container');
 
     let currentHostname = '';
 
@@ -17,19 +23,54 @@ document.addEventListener('DOMContentLoaded', () => {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
+    function showToast(message, duration = 3000) {
+        toastMessageEl.textContent = message;
+        toastEl.classList.remove('hidden', 'fade-out');
+
+        setTimeout(() => {
+            toastEl.classList.add('fade-out');
+            setTimeout(() => {
+                toastEl.classList.add('hidden');
+            }, 300);
+        }, duration);
+    }
+
     function updateUI(state) {
-        // CHANGE: Added a check to ensure state object exists before updating UI.
-        if (!state) return; 
-        
+        container.classList.remove('loading');
+
+        if (!state) {
+            hostnameEl.textContent = 'Error loading state';
+            return;
+        }
+
         hostnameEl.textContent = currentHostname;
         enabledSwitch.checked = state.isEnabled;
         itemCountEl.textContent = state.itemCount;
         cacheSizeEl.textContent = formatBytes(state.totalSize);
         savingsSizeEl.textContent = formatBytes(state.savings);
         purgeButton.disabled = state.itemCount === 0;
+
+        // Update hit/miss stats
+        if (state.stats) {
+            cacheHitsEl.textContent = state.stats.hits;
+            cacheMissesEl.textContent = state.stats.misses;
+
+            const total = state.stats.hits + state.stats.misses;
+            const hitRate = total > 0 ? Math.round((state.stats.hits / total) * 100) : 0;
+            hitRateEl.textContent = hitRate + '%';
+        }
     }
 
+    // Listen for large asset notifications from background
+    chrome.runtime.onMessage.addListener((message) => {
+        if (message.type === 'largeAssetServed') {
+            showToast(`⚡ Saved ${formatBytes(message.size)} from cache!`);
+        }
+    });
+
     // Get current tab and initialize UI
+    container.classList.add('loading');
+
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0] && tabs[0].url) {
             const url = new URL(tabs[0].url);
@@ -38,29 +79,44 @@ document.addEventListener('DOMContentLoaded', () => {
                 chrome.runtime.sendMessage({ type: 'getState', hostname: currentHostname }, (state) => {
                     if (chrome.runtime.lastError) {
                         console.error("Popup Error:", chrome.runtime.lastError.message);
+                        container.classList.remove('loading');
+                        hostnameEl.textContent = 'Error connecting to extension';
                     } else {
                         updateUI(state);
                     }
                 });
             } else {
+                container.classList.remove('loading');
                 hostnameEl.textContent = "Cannot cache this page";
-                document.querySelector('.container').innerHTML = `<p>Caching is not available for internal <code>${url.protocol}</code> pages.</p>`;
+                container.innerHTML = `
+                    <div class="header">
+                        <h3>Assets Cacher</h3>
+                        <p>Caching is not available for internal <code>${url.protocol}</code> pages.</p>
+                    </div>
+                `;
             }
+        } else {
+            container.classList.remove('loading');
+            hostnameEl.textContent = 'No active tab';
         }
     });
 
     // --- Event Listeners ---
     enabledSwitch.addEventListener('change', () => {
+        container.classList.add('loading');
         chrome.runtime.sendMessage({
             type: 'toggleSite',
             hostname: currentHostname,
             enabled: enabledSwitch.checked
+        }, () => {
+            container.classList.remove('loading');
         });
     });
 
     purgeButton.addEventListener('click', () => {
+        container.classList.add('loading');
         chrome.runtime.sendMessage({ type: 'purgeSiteCache', hostname: currentHostname }, () => {
-             chrome.runtime.sendMessage({ type: 'getState', hostname: currentHostname }, updateUI);
+            chrome.runtime.sendMessage({ type: 'getState', hostname: currentHostname }, updateUI);
         });
     });
 

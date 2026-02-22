@@ -1,73 +1,119 @@
-# 🧠 Assets Cacher
+# Assets Cacher
 
-- A lightweight Chrome extension to reduce bandwidth usage by caching frequently downloaded assets like images, scripts, and fonts, with per-site controls.
+A Chrome extension (Manifest V3) that observes network traffic and maintains a local IndexedDB copy of static assets (images, scripts, stylesheets, fonts). It tracks cache hit/miss statistics per-session and persists asset metadata across browser restarts using lazy per-site loading.
+
+> **Note**: This extension does not intercept or redirect requests. It operates as a passive observer and persistent cache layer alongside the browser's built-in HTTP cache.
 
 ---
 
-## 🤔 What's the Big Idea?
+## What it does
 
-Do you visit websites that are heavy on images or use the same JavaScript libraries on every page? Every time you navigate, your browser might be re-downloading these same assets, consuming your bandwidth and slowing down page loads.
+When you browse a website, the extension watches completed network requests via `chrome.webRequest.onCompleted`. For each successful GET request whose `Content-Type` is not in the disallowed list (HTML, JSON, XML, octet-stream), it:
 
-**Assets Cacher** intercepts these requests. The first time an asset is downloaded, the extension saves a copy. On all subsequent requests for that *exact same asset*, it serves the saved copy directly from your local machine, resulting in near-instantaneous loads and saving you data.
+1. Fetches the response body separately via `fetch()`
+2. Compresses JS and CSS assets using `CompressionStream` (gzip)
+3. Stores the full asset (as a data URL or compressed base64) in IndexedDB
+4. Keeps lightweight metadata in an in-memory `siteCache` object
 
-## ✨ Key Features
+On subsequent requests to the same normalized URL, `onBeforeRequest` checks the in-memory metadata and records a hit.
 
--   **Selective Caching**: Intelligently caches common asset types like images (`jpg`, `png`, `webp`), scripts (`js`), stylesheets (`css`), and fonts.
--   **Per-Site Control**: Easily enable or disable caching for any website with a single click in the extension popup.
--   **Stale Cache Validation**: Uses `ETag` and `Last-Modified` headers to automatically check if an asset has been updated on the server. If it has, the new version is fetched and re-cached.
--   **Cache Management**:
-    -   View the number of cached items and the total size of the cache for the current site.
-    -   Manually purge the entire cache for a specific site with one button.
--   **Bandwidth Savings**: Drastically reduces data consumption on asset-heavy websites you frequent.
--   **Built for Manifest V3**: Uses the modern, secure Chrome Extension platform.
+## What it does not do
 
-## 🚀 Installation
+- It does **not** serve cached assets back to the page. The browser still makes its normal network requests. The extension is tracking and storing, not intercepting.
+- It does **not** replace the browser's HTTP cache. It runs alongside it.
+- Hit/miss statistics reflect whether the extension has previously *seen* an asset, not whether the browser served it from its own cache.
 
-Since this extension is not on the Chrome Web Store, you can install it locally by following these steps:
+---
 
-1.  **Download the Code**:
-    -   Clone this repository to your local machine:
-        ```bash
-        git clone https://github.com/Akhil-Chaturvedi/Assets-Cacher.git
-        ```
-    -   Or, click the "Code" button on GitHub and select **"Download ZIP"**, then unzip the file.
+## Features
 
-2.  **Open Chrome Extensions**:
-    -   Open your Google Chrome browser.
-    -   Navigate to `chrome://extensions` in the address bar.
+- **Per-site toggle**: Enable or disable caching on a per-hostname basis via the popup.
+- **In-memory hit tracking**: `onBeforeRequest` checks asset URLs against the in-memory cache and records hits/misses to `chrome.storage.local`.
+- **Lazy persistence**: On browser restart, the service worker's memory is cleared. When you visit a site, only that site's cached metadata is loaded from IndexedDB via the `initiator` index. No bulk load at startup.
+- **gzip compression**: JS and CSS assets are compressed with `CompressionStream` before being stored in IndexedDB to reduce disk usage.
+- **Cache eviction**: A configurable max-age policy (1/7/30 days, or unlimited) is checked hourly via `chrome.alarms`.
+- **Stale detection**: Uses `ETag` and `Last-Modified` headers to skip re-caching unchanged assets.
+- **Badge**: The extension icon shows the count of cached items for the active tab's hostname.
+- **Options page**: Global stats (total items, total size, bandwidth saved), a visual cache inspector with type filters (images/scripts/styles/fonts), a detailed table view, and cache eviction settings.
 
-3.  **Enable Developer Mode**:
-    -   In the top-right corner of the Extensions page, toggle on the **"Developer mode"** switch.
+---
 
-4.  **Load the Extension**:
-    -   Click the **"Load unpacked"** button that appears.
-    -   In the file selection dialog, navigate to and select the `assets-cacher` folder (the one that contains `manifest.json`).
-    -   Click "Select Folder".
+## File structure
 
-The extension is now installed! You should see the "Assets Cacher" icon (you may need to pin it) in your Chrome toolbar.
+```
+Assets-Cacher/
+  manifest.json        # MV3 manifest; permissions: storage, webRequest, tabs, alarms, declarativeNetRequest
+  background.js        # Service worker: request observation, caching logic, message handling
+  db.js                # IndexedDB wrapper (assets store, initiator index, CRUD operations)
+  popup.html / .js     # Extension popup: per-site stats, toggle, purge
+  popup.css            # Shared styles for popup and options page
+  options.html / .js   # Options page: global stats, cache inspector grid, eviction settings
+  icons/               # Extension icons (16/48/128px)
+```
 
-## 🛠️ How to Use
+## Architecture
 
-1.  **Navigate** to any website.
-2.  **Click** on the Assets Cacher icon in your toolbar to open the popup.
-3.  **Enable Caching**: The popup will show the current site's hostname. Use the toggle switch to enable caching for this site.
-4.  **Browse**: As you browse the site, the extension will automatically start caching eligible assets in the background. Reload a page to see the effect—assets will be served from the cache on the second load.
-5.  **Check Status**: Click the icon again at any time to see how many items have been cached and the total disk space saved.
-6.  **Purge Cache**: If you're experiencing issues or want to clear the stored data for the site, simply click the **"Purge Cache for this Site"** button.
+```
+                  onBeforeRequest                    onCompleted
+  Browser -------> [check in-memory] -------> [fetch + store in IndexedDB]
+  request          siteCache[host]              if new or stale asset
+                   hit? -> recordHit()
+                   miss? -> (no action)
 
-## ⚙️ How It Works (The Technical Details)
+  On site visit:   ensureSiteLoaded(host)
+                   -> IndexedDB.getAll(initiator index, host)
+                   -> populate siteCache[host]
+```
 
-This extension uses a two-step process aligned with Manifest V3's non-blocking API requirements:
+**Storage layers:**
 
-1.  **Redirection (`onBeforeRequest`)**: This listener fires *before* a network request is made. It performs a very fast check against the in-memory cache. If a fresh, valid asset exists, it uses the `chrome.declarativeNetRequest` API to create a dynamic rule that redirects the request to a local `blob:` URL, skipping the network entirely.
+| Layer | Contents | Lifetime |
+|---|---|---|
+| `siteCache` (memory) | URL-keyed metadata (size, etag, content-type, timestamps) | Service worker lifetime + lazy reload from IndexedDB |
+| IndexedDB `AssetCacheDB` | Full asset data (data URLs, compressed blobs) + metadata | Persistent until purged or evicted |
+| `chrome.storage.local` | Stats (hits/misses/bytesSaved), site preferences, settings | Persistent |
 
-2.  **Caching & Validation (`onCompleted`)**: This listener fires *after* a network request has finished.
-    -   It checks the response's `Content-Type` header to see if the asset is cacheable.
-    -   It compares the response's `ETag` and `Last-Modified` headers against any existing cached version.
-    -   If the asset is new or has been updated (stale cache), it fetches the full content in the background, creates a `blob:`, and stores it in the cache for future requests.
+---
 
-This separation ensures that the performance-critical redirection path is as fast as possible, while the heavier work of caching happens asynchronously.
+## Installation
 
-## 📜 License
+1. Clone or download this repository.
+2. Open `chrome://extensions` in Chrome.
+3. Enable **Developer mode** (top-right toggle).
+4. Click **Load unpacked** and select the project folder (the one containing `manifest.json`).
+5. Pin the extension icon for easy access.
 
-This project is licensed under the GPL-3.0 License.
+## Usage
+
+1. Navigate to any website.
+2. Click the extension icon. The popup shows the current hostname, cached item count, and hit/miss stats.
+3. Use the toggle to enable/disable caching for the current site.
+4. Browse normally. Assets are cached in the background on first load.
+5. Reload the page. You should see hits logged in the service worker console (`[Assets Cacher] HIT: ...`).
+6. Click **Purge Cache for this Site** to clear cached data for the current hostname.
+7. Open the options page (link at bottom of popup) to manage global settings and inspect cached assets.
+
+---
+
+## Known limitations
+
+- **No request interception**: The extension cannot serve cached assets back to the page in MV3. It observes and stores, but the browser still fetches from the network (or its own HTTP cache). The "Bandwidth Saved" stat reflects what *would* have been saved if the cached copy were served, not actual bytes avoided.
+- **Service worker lifecycle**: Chrome may terminate the service worker after ~30 seconds of inactivity. A keep-alive alarm runs every 24 seconds to mitigate this, but it is not guaranteed.
+- **Dynamic URLs**: Sites that use cache-busting query parameters (random hashes, timestamps) will cause frequent misses. URL normalization is minimal (`origin + pathname + search`).
+- **Double fetch**: Because `onCompleted` fires after the browser has already received the response, the extension does a second `fetch()` to get the body for storage. This means each new asset is effectively downloaded twice on first encounter.
+- **Storage limits**: IndexedDB has no hard limit in Chrome, but very large caches (thousands of assets with data URLs) will consume significant disk space.
+
+## Permissions
+
+| Permission | Reason |
+|---|---|
+| `storage` | Persist stats, site preferences, and settings |
+| `webRequest` | Observe `onBeforeRequest` and `onCompleted` events |
+| `tabs` | Read active tab URL for hostname-based cache lookups |
+| `alarms` | Periodic cache eviction and service worker keep-alive |
+| `declarativeNetRequest` | Declared in manifest (legacy, not currently used) |
+| `<all_urls>` (host) | Observe requests to all origins |
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).

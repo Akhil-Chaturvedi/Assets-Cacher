@@ -4,10 +4,15 @@
     <meta charset="UTF-8">
     <title>Assets Cacher</title>
     <link rel="stylesheet" href="popup.css">
-    <style>.options-link { margin-top: 16px; text-align: center; } </style>
 </head>
 <body>
     <div class="container">
+        <!-- Toast notification container -->
+        <div id="toast" class="toast hidden">
+            <span class="toast-icon">⚡</span>
+            <span id="toast-message">Large asset served from cache!</span>
+        </div>
+        
         <div class="header">
             <h3>Assets Cacher</h3>
             <p id="hostname">Loading...</p>
@@ -26,6 +31,24 @@
             <p><strong>Bandwidth Saved:</strong> <span id="savings-size" class="savings">0 KB</span></p>
             <p><strong>Cached Items:</strong> <span id="item-count">0</span></p>
             <p><strong>Total Size:</strong> <span id="cache-size">0 KB</span></p>
+        </div>
+        
+        <div class="stats-section hit-miss-section">
+            <h4>Session Statistics</h4>
+            <div class="hit-miss-stats">
+                <div class="stat-item hit">
+                    <span class="stat-value" id="cache-hits">0</span>
+                    <span class="stat-label">Hits</span>
+                </div>
+                <div class="stat-item miss">
+                    <span class="stat-value" id="cache-misses">0</span>
+                    <span class="stat-label">Misses</span>
+                </div>
+                <div class="stat-item rate">
+                    <span class="stat-value" id="hit-rate">0%</span>
+                    <span class="stat-label">Hit Rate</span>
+                </div>
+            </div>
         </div>
 
         <button id="purge-button">Purge Cache for this Site</button>
