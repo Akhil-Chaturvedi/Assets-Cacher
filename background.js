@@ -12,12 +12,189 @@ let statWriteTimer = null;
 
 // --- Configuration ---
 const DISALLOWED_CONTENT_TYPES = [
-    "text/html", "application/json", "application/xml", "text/xml", "application/octet-stream"
+    "text/html", "application/json", "application/xml", "text/xml"
 ];
 const COMPRESSIBLE_TYPES = ["application/javascript", "text/javascript", "text/css"];
 const LARGE_ASSET_THRESHOLD = 500 * 1024; // 500KB
 
 console.log("[Assets Cacher] Service worker starting...");
+
+// --- DNR Utility ---
+function hashUrlToId(url) {
+    let hash = 0;
+    for (let i = 0; i < url.length; i++) {
+        hash = ((hash << 5) - hash) + url.charCodeAt(i);
+        hash |= 0;
+    }
+    return Math.abs(hash) + 1; // DNR ID must be >= 1
+}
+
+async function loadDnrRulesForHost(hostname) {
+    if (!hostname) return;
+
+    // 1. Remove ALL existing dynamic rules to stay under 30k limit
+    const oldRules = await chrome.declarativeNetRequest.getDynamicRules();
+    const oldRuleIds = oldRules.map(r => r.id);
+
+    // 2. Fetch all cached URLs for this specific host
+    const assets = await getAssetsByInitiator(hostname);
+    if (!assets || assets.length === 0) {
+        if (oldRuleIds.length > 0) {
+            await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: oldRuleIds });
+        }
+        return;
+    }
+
+    // 3. Build new rule set (Capped at 29,000 just to be safe)
+    const newRules = [];
+    const maxRules = Math.min(assets.length, 29000);
+
+    for (let i = 0; i < maxRules; i++) {
+        const url = assets[i].rawUrl || assets[i].url;
+        newRules.push({
+            id: hashUrlToId(url),
+            priority: 1,
+            action: {
+                type: 'redirect',
+                redirect: { extensionPath: `/proxy.html?url=${encodeURIComponent(url)}` }
+            },
+            condition: {
+                urlFilter: url,
+                resourceTypes: ["stylesheet", "script", "image", "font", "media", "object", "other"]
+            }
+        });
+    }
+
+    // 4. Atomic swap (Remove old, add new)
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: oldRuleIds,
+        addRules: newRules
+    }).catch(e => console.error("[Assets Cacher] DNR Swap Error:", e));
+
+    console.log(`[Assets Cacher] Loaded ${newRules.length} DNR rules for ${hostname}`);
+}
+
+async function updateDnrRule(url) {
+    // Only add a new rule dynamically if we have room. 
+    // Usually, loadDnrRulesForHost handles the bulk load on navigation.
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    if (rules.length >= 29000) return;
+
+    const id = hashUrlToId(url);
+    const extensionPath = `/proxy.html?url=${encodeURIComponent(url)}`;
+
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [id],
+        addRules: [{
+            id: id,
+            priority: 1,
+            action: {
+                type: 'redirect',
+                redirect: { extensionPath }
+            },
+            condition: {
+                urlFilter: url,
+                resourceTypes: ["stylesheet", "script", "image", "font", "media", "object", "other"]
+            }
+        }]
+    }).catch((e) => { });
+}
+
+async function removeDnrRule(url) {
+    const id = hashUrlToId(url);
+    await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [id]
+    }).catch((e) => { });
+}
+
+// --- Service Worker Fetch Intercept ---
+self.addEventListener('fetch', (event) => {
+    const requestUrl = new URL(event.request.url);
+
+    // We only care about requests to our proxy endpoint
+    if (requestUrl.pathname === '/proxy.html') {
+        const targetUrl = requestUrl.searchParams.get('url');
+        if (!targetUrl) return;
+
+        event.respondWith((async () => {
+            try {
+                // Hard Refresh Bypass (Ctrl+Shift+R)
+                if (event.request.cache === 'reload' || event.request.cache === 'no-cache' ||
+                    event.request.headers.get('Cache-Control') === 'no-cache') {
+                    console.log(`[Assets Cacher] Hard Refresh detected, bypassing cache for ${targetUrl}`);
+                    return fetch(targetUrl, { cache: 'no-store' }); // Let the normal onCompleted listener catch and update it!
+                }
+
+                // Determine if site is disabled
+                const hostname = new URL(targetUrl).hostname;
+                const { site_prefs } = await chrome.storage.local.get('site_prefs');
+                if ((site_prefs || {})[hostname]?.enabled === false) {
+                    return fetch(targetUrl, { mode: 'no-cors' }); // Fallback to network
+                }
+
+                const asset = await getAsset(targetUrl);
+
+                if (asset && asset.blob) {
+                    console.log(`[Assets Cacher] SW HIT: ${targetUrl.substring(0, 60)}...`);
+                    queueStatUpdate('hit', asset.size, targetUrl);
+
+                    // 24 Hour Stale-While-Revalidate Logic
+                    const now = Date.now();
+                    const lastValidated = asset.lastValidated || asset.cachedOn;
+                    const oneDayMs = 24 * 60 * 60 * 1000;
+
+                    if (now - lastValidated > oneDayMs) {
+                        event.waitUntil((async () => {
+                            try {
+                                const headers = {};
+                                if (asset.etag) headers['If-None-Match'] = asset.etag;
+                                if (asset.lastModified) headers['If-Modified-Since'] = asset.lastModified;
+
+                                // Fetch silently in background
+                                const response = await fetch(targetUrl, { headers });
+
+                                if (response.status === 200) {
+                                    // Asset has updated! Download new version quietly
+                                    const blob = await response.blob();
+                                    asset.blob = blob;
+                                    asset.cachedOn = Date.now();
+                                    asset.lastAccessed = Date.now();
+                                    asset.lastValidated = Date.now();
+                                    await setAsset(asset);
+                                    console.log(`[Assets Cacher] SW Updated asset in background: ${targetUrl.substring(0, 60)}...`);
+                                } else if (response.status === 304) {
+                                    // Not modified, just touch last accessed
+                                    asset.lastAccessed = Date.now();
+                                    asset.lastValidated = Date.now();
+                                    await setAsset(asset);
+                                }
+                            } catch (e) {
+                                // Offline or network error during SWR, ignore
+                            }
+                        })());
+                    } else {
+                        // Skip validation, just bump access time in memory
+                        asset.lastAccessed = Date.now();
+                        setAsset(asset).catch(() => { }); // fire and forget
+                    }
+
+                    // Serve from cache immediately!
+                    return new Response(asset.blob, {
+                        headers: {
+                            'Content-Type': asset.contentType,
+                            'Cache-Control': 'public, max-age=3153600'
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error("[Assets Cacher] Fetch handler error:", e);
+            }
+
+            // Fallback: If anything fails or not in DB, fetch from network directly
+            return fetch(targetUrl, { mode: 'no-cors' });
+        })());
+    }
+});
 
 // --- URL Normalization ---
 function normalizeUrl(url) {
@@ -99,12 +276,8 @@ function ensureSiteLoaded(hostname) {
 }
 
 // --- Compression Helpers ---
-async function compressData(text, contentType) {
-    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
-    const compressedBuffer = await new Response(stream).arrayBuffer();
-    return new Blob([compressedBuffer], { type: contentType });
-}
-
+// Removed compression as it wastes CPU for assets not sent back via HTTP.
+// Blobs are stored efficiently in LevelDB by Chrome locally.
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 B';
     const k = 1024;
@@ -115,6 +288,7 @@ function formatBytes(bytes) {
 
 // --- Stats Batching System ---
 function queueStatUpdate(type, size = 0, url = null) {
+    // Only missed items trigger misses now, hits are triggered via the SW fetch intercept
     if (type === 'hit') pendingStats.hits++;
     if (type === 'miss') pendingStats.misses++;
     pendingStats.bytesSaved += size;
@@ -165,8 +339,10 @@ async function flushStats() {
 chrome.runtime.onInstalled.addListener(() => {
     console.log("[Assets Cacher] onInstalled triggered");
     chrome.alarms.create('cacheEviction', { periodInMinutes: 60 });
-    chrome.alarms.create('keepAlive', { periodInMinutes: 1.0 }); // Min is 1 minute
     chrome.action.setBadgeBackgroundColor({ color: '#2d2d2d' });
+
+    // Ensure session storage handles keeps the keep-alives natively now 
+    // Wait, let's keep it simple and just rely on webRequest events to keep SW active.
 
     chrome.storage.local.get(['stats'], (data) => {
         if (!data.stats) {
@@ -180,14 +356,6 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'cacheEviction') {
         evictOldCache();
-    } else if (alarm.name === 'keepAlive') {
-        // Keeps the service worker alive by querying storage
-        chrome.storage.local.get('_keepAlive');
-        // Force flush stats just in case SW is about to die
-        if (statWriteTimer) {
-            clearTimeout(statWriteTimer);
-            flushStats();
-        }
     }
 });
 
@@ -208,44 +376,23 @@ async function updateActionBadge(tabId) {
 
 chrome.tabs.onActivated.addListener((activeInfo) => updateActionBadge(activeInfo.tabId));
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (changeInfo.status === 'complete' && tab.active) updateActionBadge(tabId);
+    if (changeInfo.status === 'complete' && tab.active) {
+        updateActionBadge(tabId);
+        if (tab.url && tab.url.startsWith('http')) {
+            const hostname = new URL(tab.url).hostname;
+            loadDnrRulesForHost(hostname);
+        }
+    }
 });
 
 // --- Caching Logic ---
-chrome.webRequest.onBeforeRequest.addListener(
-    (details) => {
-        if (details.method !== "GET") return;
-        const initiator = details.initiator;
-        if (!initiator || !initiator.startsWith('http')) return;
-
-        // Process asynchronously
-        (async () => {
-            try {
-                const hostname = new URL(initiator).hostname;
-
-                // Lazy load this site's cache from IndexedDB
-                await ensureSiteLoaded(hostname);
-
-                // We update LRU here to keep the site active in memory
-                updateLRU(hostname);
-
-                const url = normalizeUrl(details.url);
-                const cachedMeta = siteCache[hostname]?.assets?.[url];
-
-                if (cachedMeta) {
-                    console.log(`[Assets Cacher] HIT: ${url.substring(0, 60)}...`);
-                    queueStatUpdate('hit', cachedMeta.size, url);
-                }
-            } catch (e) {
-                // Ignore errors
-            }
-        })();
-    },
-    { urls: ["<all_urls>"] }
-);
+// Removed onBeforeRequest since DNR handles the hits natively via redirects directly to our SW.
 
 chrome.webRequest.onCompleted.addListener(
     (details) => {
+        // Avoid intercepting our own proxy fetches or web-accessible requests
+        if (details.url.startsWith('chrome-extension://')) return;
+
         // Optimization: skip if served directly from browser cache
         if (details.fromCache) return;
 
@@ -265,11 +412,17 @@ chrome.webRequest.onCompleted.addListener(
 async function validateAndCacheAsset(details, contentType) {
     try {
         const { initiator, tabId } = details;
-        const url = normalizeUrl(details.url);
+        const rawUrl = details.url;
+        const url = normalizeUrl(rawUrl);
 
-        if (!initiator || !initiator.startsWith('http')) return;
+        // Let's avoid recursive loops on data/blob urls or proxies
+        if (!url.startsWith('http')) return;
 
-        const hostname = new URL(initiator).hostname;
+        // Extract hostname safely
+        let hostname;
+        try {
+            hostname = new URL(initiator || url).hostname;
+        } catch (e) { return; }
 
         // Ensure site cache is loaded
         await ensureSiteLoaded(hostname);
@@ -292,47 +445,37 @@ async function validateAndCacheAsset(details, contentType) {
 
         let response;
         try {
-            response = await fetch(details.url);
+            response = await fetch(rawUrl);
             if (!response.ok) return;
         } catch (e) {
             // CORS or network failure
-            console.warn(`[Assets Cacher] Fetch failed for ${url.substring(0, 60)}... (CORS or Network Error)`);
+            console.warn(`[Assets Cacher] Fetch failed for ${url.substring(0, 60)}...`);
             return;
         }
 
         const blob = await response.blob();
         const sizeInBytes = blob.size;
 
-        let compressed = false;
-        let finalBlob = blob;
-
-        if (COMPRESSIBLE_TYPES.some(type => contentType.startsWith(type))) {
-            try {
-                const text = await blob.text();
-                finalBlob = await compressData(text, contentType);
-                compressed = true;
-                console.log(`[Assets Cacher] Compressed ${url.substring(0, 60)}...: ${sizeInBytes} -> ${finalBlob.size} bytes`);
-            } catch (e) {
-                console.warn("[Assets Cacher] Compression failed:", e);
-                finalBlob = blob;
-            }
-        }
-
         const newAsset = {
             url,
+            rawUrl, // Store raw URL to use in DNR conditions
             initiator: hostname,
-            blob: finalBlob, // Native Blob storage
-            compressed,
+            blob: blob, // Native Blob storage
+            compressed: false, // Retired compression
             contentType,
             size: sizeInBytes,
             etag,
             lastModified,
             cachedOn: Date.now(),
-            lastAccessed: Date.now()
+            lastAccessed: Date.now(),
+            lastValidated: Date.now()
         };
 
         // Store in IndexedDB (don't await - fire and forget)
         setAsset(newAsset).catch(e => console.error("[Assets Cacher] DB write error:", e));
+
+        // Tell DNR to intercept this exact rawURL on future navigations!
+        await updateDnrRule(rawUrl);
 
         // Update in-memory cache immediately
         if (!siteCache[hostname]) siteCache[hostname] = { totalSize: 0, assets: {} };
@@ -347,7 +490,7 @@ async function validateAndCacheAsset(details, contentType) {
             cachedOn: newAsset.cachedOn,
             lastAccessed: newAsset.lastAccessed,
             contentType,
-            compressed
+            compressed: false
         };
         siteCache[hostname].totalSize += sizeInBytes;
 
@@ -356,7 +499,7 @@ async function validateAndCacheAsset(details, contentType) {
         // Update badge
         if (tabId !== -1) updateActionBadge(tabId);
 
-        console.log(`[Assets Cacher] Cached: ${url.substring(0, 60)}... (${formatBytes(sizeInBytes)})`);
+        console.log(`[Assets Cacher] Cached + DNR Intercept Set: ${url.substring(0, 60)}...`);
     } catch (e) {
         console.error(`[Assets Cacher] Failed to cache:`, e);
     }
@@ -406,7 +549,7 @@ async function handleMessage(message) {
         if (!newPrefs[hostname]) newPrefs[hostname] = {};
         newPrefs[hostname].enabled = enabled;
         await chrome.storage.local.set({ site_prefs: newPrefs });
-        if (!enabled) await purgeSiteCache(message.hostname);
+        // Instead of purging disabled site's cache, it simply bypassed in SW 'fetch' now
         return { success: true };
     } else if (message.type === 'purgeSiteCache') {
         await purgeSiteCache(message.hostname);
@@ -438,36 +581,7 @@ async function handleMessage(message) {
         }
         return allAssets;
     } else if (message.type === 'getAssetPreview') {
-        const asset = await getAsset(message.url);
-        // We will return true if asset exists. The UI will have to create Object URL
-        // Unfortunately MV3 background service workers cannot create Object URLs!
-        // So we will just pass the Blob to the popup if possible? No, we can't pass blobs across message channels.
-        // Oh wait, MV3 cannot use Blob URLs locally in SW anyway.
-        // But options page is a normal DOM page, it can create Object URLs!
-        return {
-            hasAsset: !!asset,
-            // Since we can't send Blob over chrome messages easily if it's too big, 
-            // actually we can send Blobs but maybe it's better to fetch from DB on the client side?
-            // Wait, we can't send Blob over postMessage? Actually chrome.runtime.sendMessage can send Blobs!
-            // BUT sending 1MB array down the message channel is slow.
-            // Wait, I can send the blob directly.
-            // However, previous version sent a Base64 string dataUrl! So string worked.
-            // Let's just return the asset. The popup/options can do what they need.
-        };
-    } else if (message.type === 'getAssetBlob') {
-        // We probably cannot send exact Blob object efficiently, but let's try.
-        // Wait, sending Blob over sendMessage works but might be serialized.
-        const asset = await getAsset(message.url);
-        if (asset && asset.blob) {
-            // Convert to base64 ONLY on demand for the preview!
-            const base64 = await new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.readAsDataURL(asset.blob);
-            });
-            return { dataUrl: base64 };
-        }
-        return { dataUrl: null };
+        return { hasAsset: true }; // Options handles blob load
     } else if (message.type === 'purgeAll') {
         await purgeAllCache();
         return { success: true };
@@ -485,6 +599,9 @@ async function handleMessage(message) {
 async function purgeSiteCache(hostname) {
     if (siteCache[hostname]) {
         for (const url in siteCache[hostname].assets) {
+            // IMPORTANT: Remove DNR intercept!
+            const assetRawUrl = siteCache[hostname].assets[url].rawUrl || url;
+            await removeDnrRule(assetRawUrl);
             await deleteAsset(url);
         }
         delete siteCache[hostname];
@@ -496,6 +613,14 @@ async function purgeSiteCache(hostname) {
 
 async function purgeAllCache() {
     await clearAllAssets();
+
+    // Clear all DNR rules
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    const ids = rules.map(r => r.id);
+    if (ids.length > 0) {
+        await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids });
+    }
+
     siteCache = {};
     siteLoadPromises.clear();
     await chrome.storage.local.set({
@@ -519,6 +644,10 @@ async function evictOldCache() {
         for (const url in siteCache[host].assets) {
             const asset = siteCache[host].assets[url];
             if (now - asset.cachedOn > maxAgeMs) {
+                // Remove DNR Intercept
+                const assetRawUrl = asset.rawUrl || url;
+                await removeDnrRule(assetRawUrl);
+
                 await deleteAsset(url);
                 delete siteCache[host].assets[url];
                 siteCache[host].totalSize -= asset.size;

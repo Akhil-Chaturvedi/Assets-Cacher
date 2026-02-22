@@ -1,38 +1,28 @@
 # Assets Cacher
 
-A Chrome extension (Manifest V3) that observes network traffic and maintains a local IndexedDB copy of static assets (images, scripts, stylesheets, fonts). It tracks cache hit/miss statistics per-session and persists asset metadata across browser restarts using lazy per-site loading.
-
-> **Note**: This extension does not intercept or redirect requests. It operates as a passive observer and persistent cache layer alongside the browser's built-in HTTP cache.
+A Chrome extension (Manifest V3) that natively intercepts network traffic and serves static assets (images, scripts, stylesheets, fonts) directly from an offline IndexedDB cache, saving you real bandwidth. It tracks cache hit/miss statistics per-session and persists asset metadata across browser restarts using lazy per-site loading.
 
 ---
 
-## What it does
+## What makes this unique?
 
-When you browse a website, the extension watches completed network requests via `chrome.webRequest.onCompleted`. For each successful GET request whose `Content-Type` is not in the disallowed list (HTML, JSON, XML, octet-stream), it:
+Under Manifest V3, Chrome completely banned extensions from using the blocking WebRequest API to intercept and fulfill network requests out of thin air. Most caching extensions broke or were forced to become passive analytics trackers.
 
-1. Fetches the response body separately via `fetch()`
-2. Compresses JS and CSS assets using `CompressionStream` (gzip)
-3. Stores the full asset (as a data URL or compressed base64) in IndexedDB
-4. Keeps lightweight metadata in an in-memory `siteCache` object
+**Assets Cacher bypasses this limitation** by combining two modern APIs:
+1. **Declarative Net Request (DNR)**: When the extension caches a file, it registers a dynamic DNR rule telling Chrome: *"If the browser asks for this URL again, silently redirect the request to our extension's internal proxy endpoint."*
+2. **Service Worker Fetch Listener**: The extension's background script intercepts requests directed at its internal proxy endpoint, reads the raw `Blob` natively from IndexedDB, and serves it back to the page instantly. 
 
-On subsequent requests to the same normalized URL, `onBeforeRequest` checks the in-memory metadata and records a hit.
-
-## What it does not do
-
-- It does **not** serve cached assets back to the page. The browser still makes its normal network requests. The extension is tracking and storing, not intercepting.
-- It does **not** replace the browser's HTTP cache. It runs alongside it.
-- Hit/miss statistics reflect whether the extension has previously *seen* an asset, not whether the browser served it from its own cache.
+**Result:** True **0-byte** offline cache hits that completely bypass your ISP, even on Manifest V3.
 
 ---
 
 ## Features
 
+- **True Offline Caching**: Zero internet bandwidth is consumed for cached assets. The browser is natively redirected to a local proxy.
+- **Stale-While-Revalidate**: When the extension serves a cached file, it silently pings the server in the background (using `If-Modified-Since` and `ETag`). If the server has a newer version, the extension quietly downloads it and overwrites the cache so your next visit is seamless.
+- **Native Blob Storage**: Assets are stored natively as binary `Blob` objects inside IndexedDB. No wasteful Base64 encoding.
+- **Memory Safe**: The in-memory cache enforces a strict 30-site LRU (Least Recently Used) limit, gracefully managing RAM on long browsing sessions.
 - **Per-site toggle**: Enable or disable caching on a per-hostname basis via the popup.
-- **In-memory hit tracking**: `onBeforeRequest` checks asset URLs against the in-memory cache and records hits/misses to `chrome.storage.local`.
-- **Lazy persistence**: On browser restart, the service worker's memory is cleared. When you visit a site, only that site's cached metadata is loaded from IndexedDB via the `initiator` index. No bulk load at startup.
-- **gzip compression**: JS and CSS assets are compressed with `CompressionStream` before being stored in IndexedDB to reduce disk usage.
-- **Cache eviction**: A configurable max-age policy (1/7/30 days, or unlimited) is checked hourly via `chrome.alarms`.
-- **Stale detection**: Uses `ETag` and `Last-Modified` headers to skip re-caching unchanged assets.
 - **Badge**: The extension icon shows the count of cached items for the active tab's hostname.
 - **Options page**: Global stats (total items, total size, bandwidth saved), a visual cache inspector with type filters (images/scripts/styles/fonts), a detailed table view, and cache eviction settings.
 
@@ -43,8 +33,9 @@ On subsequent requests to the same normalized URL, `onBeforeRequest` checks the 
 ```
 Assets-Cacher/
   manifest.json        # MV3 manifest; permissions: storage, webRequest, tabs, alarms, declarativeNetRequest
-  background.js        # Service worker: request observation, caching logic, message handling
-  db.js                # IndexedDB wrapper (assets store, initiator index, CRUD operations)
+  background.js        # Service worker: request observation, DNR rule creation, SW Fetch intercept
+  db.js                # IndexedDB wrapper (native Blob storage, initiator index)
+  proxy.html           # Dummy endpoint used strictly to trigger the SW Fetch intercept
   popup.html / .js     # Extension popup: per-site stats, toggle, purge
   popup.css            # Shared styles for popup and options page
   options.html / .js   # Options page: global stats, cache inspector grid, eviction settings
@@ -54,23 +45,24 @@ Assets-Cacher/
 ## Architecture
 
 ```
-                  onBeforeRequest                    onCompleted
-  Browser -------> [check in-memory] -------> [fetch + store in IndexedDB]
-  request          siteCache[host]              if new or stale asset
-                   hit? -> recordHit()
-                   miss? -> (no action)
+  Visit 1: Initial Download
+  Browser -------> [downloads abc.js natively]
+                   onCompleted fires -> Extension issues fetch() -> Stores Blob in DB
+                   DNR Rule created: "Redirect abc.js to /proxy?url=abc.js"
 
-  On site visit:   ensureSiteLoaded(host)
-                   -> IndexedDB.getAll(initiator index, host)
-                   -> populate siteCache[host]
+  Visit 2: Offline Cache Hit
+  Browser -------> [requests abc.js]
+  DNR Intercept -> [redirects to /proxy?url=abc.js]
+  SW Fetch      -> [reads Blob from DB] -> [Serves Blob instantly] 
+                   [Silently revalidates ETags in background]
 ```
 
 **Storage layers:**
 
 | Layer | Contents | Lifetime |
 |---|---|---|
-| `siteCache` (memory) | URL-keyed metadata (size, etag, content-type, timestamps) | Service worker lifetime + lazy reload from IndexedDB |
-| IndexedDB `AssetCacheDB` | Full asset data (data URLs, compressed blobs) + metadata | Persistent until purged or evicted |
+| `siteCache` (memory) | URL-keyed metadata (size, etag, content-type, timestamps) | Strict 30-site LRU limit |
+| IndexedDB `AssetCacheDB` | Full asset data (native Blobs) + metadata | Persistent until purged or evicted |
 | `chrome.storage.local` | Stats (hits/misses/bytesSaved), site preferences, settings | Persistent |
 
 ---
@@ -89,30 +81,28 @@ Assets-Cacher/
 2. Click the extension icon. The popup shows the current hostname, cached item count, and hit/miss stats.
 3. Use the toggle to enable/disable caching for the current site.
 4. Browse normally. Assets are cached in the background on first load.
-5. Reload the page. You should see hits logged in the service worker console (`[Assets Cacher] HIT: ...`).
-6. Click **Purge Cache for this Site** to clear cached data for the current hostname.
+5. Reload the page. You should see hits logged in the service worker console (`[Assets Cacher] SW HIT: ...`).
+6. Click **Purge Cache for this Site** to clear cached data (and DNR rules) for the current hostname.
 7. Open the options page (link at bottom of popup) to manage global settings and inspect cached assets.
 
 ---
 
 ## Known limitations
 
-- **No request interception**: The extension cannot serve cached assets back to the page in MV3. It observes and stores, but the browser still fetches from the network (or its own HTTP cache). The "Bandwidth Saved" stat reflects what *would* have been saved if the cached copy were served, not actual bytes avoided.
-- **Service worker lifecycle**: Chrome may terminate the service worker after ~30 seconds of inactivity. A keep-alive alarm runs every 24 seconds to mitigate this, but it is not guaranteed.
-- **Dynamic URLs**: Sites that use cache-busting query parameters (random hashes, timestamps) will cause frequent misses. URL normalization is minimal (`origin + pathname + search`).
-- **Double fetch**: Because `onCompleted` fires after the browser has already received the response, the extension does a second `fetch()` to get the body for storage. This means each new asset is effectively downloaded twice on first encounter.
-- **Storage limits**: IndexedDB has no hard limit in Chrome, but very large caches (thousands of assets with data URLs) will consume significant disk space.
+- **Double fetch on 1st visit**: Because `onCompleted` fires after the browser has already received the response, the extension must do a second `fetch()` to get the body for the initial storage. This means each new asset is downloaded twice on the *first* encounter. It pays off on the second visit!
+- **Dynamic URLs**: Sites that use cache-busting query parameters (random hashes, timestamps) will cause frequent misses. URL normalization strips common tracking parameters (like `utm_source`), but complex dynamic URLs are still hard to predict.
+- **Service worker lifecycle**: Chrome suspends background workers after inactivity, but the SW will automatically wake back up to handle `fetch` events when the DNR redirects fire.
 
 ## Permissions
 
 | Permission | Reason |
 |---|---|
 | `storage` | Persist stats, site preferences, and settings |
-| `webRequest` | Observe `onBeforeRequest` and `onCompleted` events |
+| `webRequest` | Observe `onCompleted` to index new resources |
+| `declarativeNetRequest` | Dynamically generate proxy redirection rules |
 | `tabs` | Read active tab URL for hostname-based cache lookups |
-| `alarms` | Periodic cache eviction and service worker keep-alive |
-| `declarativeNetRequest` | Declared in manifest (legacy, not currently used) |
-| `<all_urls>` (host) | Observe requests to all origins |
+| `alarms` | Periodic old cache eviction check (runs every 60 min) |
+| `<all_urls>` (host) | Observe and intercept requests to all origins |
 
 ## License
 
