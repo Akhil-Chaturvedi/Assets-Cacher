@@ -1,32 +1,31 @@
 [
-    {
-        "id": 1,
-        "priority": 1,
-        "action": {
-            "type": "modifyHeaders",
-            "responseHeaders": [
-                {
-                    "header": "Cache-Control",
-                    "operation": "set",
-                    "value": "max-age=31536000"
-                },
-                {
-                    "header": "X-Assets-Cacher-Forced",
-                    "operation": "set",
-                    "value": "true"
-                }
-            ]
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        {
+          "header": "Cache-Control",
+          "operation": "set",
+          "value": "max-age=31536000"
         },
-        "condition": {
-            "regexFilter": "(?i)\\.(js|css|woff2?|ttf|otf|eot|png|jpeg|jpg|gif|svg|webp|ico|mp4|webm|ogg|mp3|wav)(\\?.*)?$",
-            "resourceTypes": [
-                "stylesheet",
-                "script",
-                "image",
-                "font",
-                "media",
-                "object"
-            ]
+        {
+          "header": "X-Assets-Cacher-Forced",
+          "operation": "set",
+          "value": "true"
         }
+      ]
+    },
+    "condition": {
+      "regexFilter": "(?i)\\.(js|css|woff2?|ttf|otf|eot|png|jpe?g|gif|svg|webp|avif|ico|mp4|webm|ogg|mp3|wav)(?:[?#].*)?$",
+      "resourceTypes": [
+        "stylesheet",
+        "script",
+        "image",
+        "font",
+        "media"
+      ]
     }
+  }
 ]

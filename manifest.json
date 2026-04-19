@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Assets Cacher",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Overrides HTTP cache headers on static assets to reduce bandwidth consumption.",
   "permissions": [
     "storage",
     "declarativeNetRequest",
-    "declarativeNetRequestFeedback",
     "webRequest",
     "tabs"
   ],
@@ -33,5 +32,8 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
   }
 }

@@ -2,57 +2,59 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <title>Assets Cacher</title>
-    <link rel="stylesheet" href="popup.css">
+  <meta charset="UTF-8">
+  <title>Assets Cacher</title>
+  <link rel="stylesheet" href="base.css">
+  <link rel="stylesheet" href="popup.css">
 </head>
 
 <body>
-    <div class="container">
-        <div class="header">
-            <h3>Assets Cacher</h3>
-            <p id="hostname">Loading...</p>
-        </div>
-
-        <div class="toggle-section">
-            <label for="enabled-switch">Enable for this site</label>
-            <label class="switch">
-                <input type="checkbox" id="enabled-switch">
-                <span class="slider round"></span>
-            </label>
-        </div>
-
-        <div class="stats-section">
-            <h4>Session Metrics</h4>
-            <p><strong>Bandwidth Saved:</strong> <span id="savings-size" class="savings">0 KB</span></p>
-            <p><strong>Cache Hits:</strong> <span id="item-count">0</span></p>
-            <p><strong>Data Served Locally:</strong> <span id="cache-size">0 KB</span></p>
-        </div>
-
-        <div class="stats-section hit-miss-section">
-            <h4>Hit / Miss Breakdown</h4>
-            <div class="hit-miss-stats">
-                <div class="stat-item hit">
-                    <span class="stat-value" id="cache-hits">0</span>
-                    <span class="stat-label">Hits</span>
-                </div>
-                <div class="stat-item miss">
-                    <span class="stat-value" id="cache-misses">0</span>
-                    <span class="stat-label">Misses</span>
-                </div>
-                <div class="stat-item rate">
-                    <span class="stat-value" id="hit-rate">0%</span>
-                    <span class="stat-label">Hit Rate</span>
-                </div>
-            </div>
-        </div>
-
-        <button id="purge-button">Reset Site Statistics</button>
-        <div class="options-link">
-            <a href="#" id="options-link">View Dashboard</a>
-        </div>
+  <div class="container">
+    <div class="header">
+      <h3>Assets Cacher</h3>
+      <p id="hostname">Loading...</p>
     </div>
-    <script src="popup.js"></script>
+
+    <div class="toggle-section">
+      <label for="enabled-switch">Enable for this site</label>
+      <label class="switch">
+        <input type="checkbox" id="enabled-switch">
+        <span class="slider round"></span>
+      </label>
+    </div>
+
+    <div class="stats-section">
+      <h4>Session Metrics</h4>
+      <p><strong>Bandwidth Saved:</strong> <span id="savings-size" class="savings">0 KB</span></p>
+      <p><strong>Cache Hits:</strong> <span id="item-count">0</span></p>
+      <p><strong>Data Served Locally:</strong> <span id="cache-size">0 KB</span></p>
+    </div>
+
+    <div class="stats-section hit-miss-section">
+      <h4>Hit / Miss Breakdown</h4>
+      <div class="hit-miss-stats">
+        <div class="stat-item hit">
+          <span class="stat-value" id="cache-hits">0</span>
+          <span class="stat-label">Hits</span>
+        </div>
+        <div class="stat-item miss">
+          <span class="stat-value" id="cache-misses">0</span>
+          <span class="stat-label">Misses</span>
+        </div>
+        <div class="stat-item rate">
+          <span class="stat-value" id="hit-rate">0%</span>
+          <span class="stat-label">Hit Rate</span>
+        </div>
+      </div>
+    </div>
+
+    <button id="purge-button">Reset Site Statistics</button>
+    <div class="options-link">
+      <a href="#" id="options-link">View Dashboard</a>
+    </div>
+  </div>
+  <script src="shared/utils.js"></script>
+  <script src="popup.js"></script>
 </body>
 
 </html>
