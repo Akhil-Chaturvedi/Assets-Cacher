@@ -1,1 +1,26 @@
+# === Security ===
+*.pem
+key.pem
+crx_private_key
+*.pfx
+
+# === Build Artifacts ===
+*.zip
+*.crx
+build_dir/
+
+# === Browser / Development Metadata ===
 _metadata/
+.crx
+
+# === OS & IDE Noise ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+
+# === Context Snapshot Files ===
+plans/
+project_context.txt
+.contextignore

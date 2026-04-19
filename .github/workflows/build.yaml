@@ -1,0 +1,102 @@
+name: Build and Release Extension
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Determine Version & Bump if Needed
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          
+          let manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          let currentVersion = manifest.version;
+          let newVersion = currentVersion;
+          
+          try {
+            execSync(`gh release view v${currentVersion}`, { stdio: 'ignore' });
+            console.log(`Version ${currentVersion} already released. Calculating next version...`);
+            let parts = currentVersion.split('.').map(n => parseInt(n));
+            if (parts.length >= 2) {
+              parts[parts.length - 1] += 1;
+            } else {
+              parts.push(1);
+            }
+            newVersion = parts.join('.');
+            manifest.version = newVersion;
+            fs.writeFileSync('manifest.json', JSON.stringify(manifest, null, 2));
+            
+            execSync('git config user.name "github-actions[bot]"');
+            execSync('git config user.email "github-actions[bot]@users.noreply.github.com"');
+            execSync('git add manifest.json');
+            execSync(`git commit -m "chore: bump version to ${newVersion} [skip ci]"`);
+            execSync('git push');
+          } catch (e) {
+            console.log(`Version ${currentVersion} is fresh. No bump needed.`);
+          }
+          
+          const vUnderscore = newVersion.replace(/\./g, '_');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `VERSION=${newVersion}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `VERSION_UNDERSCORES=${vUnderscore}\n`);
+          EOF
+
+      - name: Package Source Code to ZIP
+        run: |
+          zip -r Assets-Cacher-v${{ steps.version.outputs.VERSION_UNDERSCORES }}.zip . \
+            -x "*.git*" \
+            -x ".github/*" \
+            -x "plans/*" \
+            -x "key.pem" \
+            -x "*.zip" \
+            -x "*.crx"
+
+      - name: Package CRX File
+        run: |
+          unzip Assets-Cacher-v${{ steps.version.outputs.VERSION_UNDERSCORES }}.zip -d build_dir
+          
+          if [ -n "${{ secrets.CRX_PRIVATE_KEY }}" ]; then
+            # Using printf to preserve line breaks in the PEM key
+            printf "%b" "${{ secrets.CRX_PRIVATE_KEY }}" > key.pem
+            echo "Using provided CRX_PRIVATE_KEY to sign the extension."
+            
+            # Build the CRX using the key
+            npx --yes crx3@latest -p key.pem -o Assets-Cacher-v${{ steps.version.outputs.VERSION_UNDERSCORES }}.crx build_dir/
+          else
+            echo "Error: CRX_PRIVATE_KEY secret is missing!"
+            exit 1
+          fi
+          
+          rm -rf build_dir key.pem
+
+      - name: Publish Release to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v${{ steps.version.outputs.VERSION }} \
+            Assets-Cacher-v${{ steps.version.outputs.VERSION_UNDERSCORES }}.zip \
+            Assets-Cacher-v${{ steps.version.outputs.VERSION_UNDERSCORES }}.crx \
+            --title "v${{ steps.version.outputs.VERSION }}" \
+            --notes "Automated release for version ${{ steps.version.outputs.VERSION }}"
